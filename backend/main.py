@@ -55,6 +55,9 @@ from schemas import (
     AssignedCallSuggestion,
     PositionLegCreate,
     PositionLegResponse,
+    PositionLegClose,
+    CallCloseImpactResponse,
+    ClosedCycleResponse,
 )
 from logging_config import setup_logging
 
@@ -486,6 +489,24 @@ async def snooze_position(position_id: int, snooze_until: str, db: Session = Dep
     return service.snooze_position(position_id, date_value)
 
 
+@app.patch("/api/positions/{position_id}/calls/{call_id}/close", response_model=PositionLegResponse)
+async def close_call_leg(position_id: int, call_id: int, payload: PositionLegClose, db: Session = Depends(get_db)):
+    service = PositionService(db)
+    return service.close_call_leg(position_id, call_id, payload)
+
+
+@app.get("/api/positions/{position_id}/calls/{call_id}/impact", response_model=CallCloseImpactResponse)
+async def get_call_close_impact(
+    position_id: int,
+    call_id: int,
+    scenario: str = Query(...),
+    buyback_premium: float | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    service = PositionService(db)
+    return service.call_close_impact(position_id, call_id, scenario, buyback_premium)
+
+
 @app.get("/api/positions/export")
 async def export_positions(db: Session = Depends(get_db)):
     import csv
@@ -570,17 +591,22 @@ async def get_assigned_calls(db: Session = Depends(get_db)):
         )
         legs_payload = [
             {
+                "id": l.id,
                 "leg_type": l.leg_type,
                 "strike": l.strike,
                 "premium_received": l.premium_received,
                 "opened_at": l.opened_at,
                 "expiration_date": l.expiration_date,
                 "status": l.status,
+                "closed_at": l.closed_at,
+                "buyback_premium": l.buyback_premium,
             }
             for l in legs
         ]
         total_premiums = (p.premium_received or 0) + sum(
             l.premium_received for l in legs if l.leg_type == "SELL CALL"
+        ) - sum(
+            l.buyback_premium or 0 for l in legs if l.leg_type == "SELL CALL" and l.status == "BOUGHT_BACK"
         )
         cost_basis_adjusted = (p.strike or 0) - total_premiums
         reduction_pct = (
@@ -711,6 +737,68 @@ async def get_assigned_calls(db: Session = Depends(get_db)):
             })
 
     return suggestions
+
+
+@app.get("/api/positions/closed-cycles", response_model=List[ClosedCycleResponse])
+async def get_closed_cycles(db: Session = Depends(get_db)):
+    positions = (
+        db.query(Position)
+        .filter(Position.status == "CLOSED")
+        .order_by(desc(Position.closed_at))
+        .all()
+    )
+    cycles: list[dict] = []
+    for p in positions:
+        legs = (
+            db.query(PositionLeg)
+            .filter(PositionLeg.position_id == p.id)
+            .order_by(PositionLeg.opened_at.asc())
+            .all()
+        )
+        legs_payload = [
+            {
+                "id": l.id,
+                "leg_type": l.leg_type,
+                "strike": l.strike,
+                "premium_received": l.premium_received,
+                "opened_at": l.opened_at,
+                "expiration_date": l.expiration_date,
+                "status": l.status,
+                "closed_at": l.closed_at,
+                "buyback_premium": l.buyback_premium,
+            }
+            for l in legs
+        ]
+        total_premiums = (p.premium_received or 0) + sum(
+            l.premium_received for l in legs if l.leg_type == "SELL CALL"
+        ) - sum(
+            l.buyback_premium or 0 for l in legs if l.status == "BOUGHT_BACK"
+        )
+        delivery_leg = next((l for l in legs if l.status == "EXERCISED"), None)
+        delivery_price = delivery_leg.strike if delivery_leg else None
+        capital_initial = p.strike * 100 * p.contracts
+        pnl_total = (
+            ((delivery_price or p.strike) - (p.strike - total_premiums)) * 100 * p.contracts
+        )
+        pnl_pct = (pnl_total / capital_initial) * 100 if capital_initial else 0
+        duration_days = (
+            (p.closed_at.date() - p.opened_at.date()).days
+            if p.closed_at and p.opened_at else None
+        )
+        cycles.append({
+            "position_id": p.id,
+            "symbol": p.symbol,
+            "closed_at": p.closed_at,
+            "capital_initial": capital_initial,
+            "total_premiums": total_premiums,
+            "delivery_price": delivery_price,
+            "pnl_total": round(pnl_total, 2),
+            "pnl_pct": round(pnl_pct, 2),
+            "duration_days": duration_days,
+            "legs": legs_payload,
+            "contracts": p.contracts,
+        })
+    return cycles
 
 
 @app.get("/api/symbol-history/{symbol}", response_model=List[SymbolHistoryResponse])

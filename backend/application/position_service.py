@@ -163,3 +163,96 @@ class PositionService:
         self.db.commit()
         self.db.refresh(position)
         return position
+
+    def _load_position_and_leg(self, position_id: int, call_id: int):
+        position = self.db.query(Position).filter(Position.id == position_id).first()
+        if not position:
+            raise HTTPException(status_code=404, detail="Position not found")
+        leg = (
+            self.db.query(PositionLeg)
+            .filter(PositionLeg.id == call_id, PositionLeg.position_id == position_id)
+            .first()
+        )
+        if not leg:
+            raise HTTPException(status_code=404, detail="Call leg not found")
+        if leg.leg_type != "SELL CALL":
+            raise HTTPException(status_code=422, detail="Not a CALL leg")
+        if leg.status != "OPEN":
+            raise HTTPException(status_code=409, detail="Call leg is not open")
+        return position, leg
+
+    def _get_position_legs(self, position_id: int):
+        return (
+            self.db.query(PositionLeg)
+            .filter(PositionLeg.position_id == position_id)
+            .order_by(PositionLeg.opened_at.asc())
+            .all()
+        )
+
+    def _total_premiums(self, position: Position, legs: list[PositionLeg]) -> float:
+        call_premiums = sum(l.premium_received for l in legs if l.leg_type == "SELL CALL")
+        buybacks = sum(
+            l.buyback_premium or 0 for l in legs if l.leg_type == "SELL CALL" and l.status == "BOUGHT_BACK"
+        )
+        return (position.premium_received or 0) + call_premiums - buybacks
+
+    def call_close_impact(self, position_id: int, call_id: int, scenario: str, buyback_premium: float | None):
+        position, leg = self._load_position_and_leg(position_id, call_id)
+        legs = self._get_position_legs(position_id)
+        total_premiums = self._total_premiums(position, legs)
+        cost_basis = (position.strike or 0) - total_premiums
+
+        if scenario == "bought_back" and buyback_premium is None:
+            raise HTTPException(status_code=422, detail="buyback_premium required")
+        if scenario not in {"expired", "exerced", "bought_back"}:
+            raise HTTPException(status_code=422, detail="Invalid scenario")
+
+        total_after = total_premiums
+        new_cost_basis = cost_basis
+        pnl_total = None
+        pnl_pct = None
+        delivery_price = None
+        capital_initial = (position.strike or 0) * 100 * position.contracts
+
+        if scenario == "bought_back":
+            total_after = total_premiums - float(buyback_premium or 0)
+            new_cost_basis = (position.strike or 0) - total_after
+        elif scenario == "exerced":
+            delivery_price = leg.strike
+            pnl_total = (delivery_price - cost_basis) * 100 * position.contracts
+            pnl_pct = (pnl_total / capital_initial) * 100 if capital_initial else 0
+
+        return {
+            "current_cost_basis": round(cost_basis, 4),
+            "new_cost_basis": round(new_cost_basis, 4),
+            "total_premiums": round(total_premiums, 4),
+            "total_premiums_after": round(total_after, 4),
+            "pnl_total": round(pnl_total, 2) if pnl_total is not None else None,
+            "pnl_pct": round(pnl_pct, 2) if pnl_pct is not None else None,
+            "delivery_price": delivery_price,
+            "capital_initial": capital_initial,
+        }
+
+    def close_call_leg(self, position_id: int, call_id: int, payload):
+        position, leg = self._load_position_and_leg(position_id, call_id)
+
+        scenario = payload.scenario
+        close_date = payload.close_date or datetime.now(timezone.utc).date()
+        if scenario == "expired":
+            leg.status = "EXPIRED"
+        elif scenario == "exerced":
+            leg.status = "EXERCISED"
+            position.status = "CLOSED"
+            position.closed_at = datetime.combine(close_date, datetime.min.time(), tzinfo=timezone.utc)
+        elif scenario == "bought_back":
+            if payload.buyback_premium is None:
+                raise HTTPException(status_code=422, detail="buyback_premium required")
+            leg.status = "BOUGHT_BACK"
+            leg.buyback_premium = payload.buyback_premium
+        else:
+            raise HTTPException(status_code=422, detail="Invalid scenario")
+
+        leg.closed_at = datetime.combine(close_date, datetime.min.time(), tzinfo=timezone.utc)
+        self.db.commit()
+        self.db.refresh(leg)
+        return leg

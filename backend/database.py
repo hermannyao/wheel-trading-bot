@@ -139,7 +139,9 @@ class PositionLeg(Base):
     dte = Column(Integer, nullable=True)
     expiration_date = Column(Date, nullable=True)
     opened_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    status = Column(String, nullable=False, default="OPEN")  # OPEN / CLOSED / EXPIRED
+    status = Column(String, nullable=False, default="OPEN")  # OPEN / EXPIRED / EXERCISED / BOUGHT_BACK
+    closed_at = Column(DateTime, nullable=True)
+    buyback_premium = Column(Float, nullable=True)
 
 
 class Alert(Base):

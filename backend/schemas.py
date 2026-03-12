@@ -96,6 +96,8 @@ class PositionLegBase(BaseModel):
     expiration_date: Optional[date] = None
     opened_at: Optional[datetime] = None
     status: Optional[str] = "OPEN"
+    closed_at: Optional[datetime] = None
+    buyback_premium: Optional[float] = None
 
 
 class PositionLegCreate(BaseModel):
@@ -112,6 +114,23 @@ class PositionLegResponse(PositionLegBase):
 
     class Config:
         from_attributes = True
+
+
+class PositionLegClose(BaseModel):
+    scenario: str  # exercised | expired | bought_back
+    buyback_premium: Optional[float] = None
+    close_date: Optional[date] = None
+
+
+class CallCloseImpactResponse(BaseModel):
+    current_cost_basis: float
+    new_cost_basis: float
+    total_premiums: float
+    total_premiums_after: float
+    pnl_total: Optional[float] = None
+    pnl_pct: Optional[float] = None
+    delivery_price: Optional[float] = None
+    capital_initial: float
 
 
 class PositionResponse(PositionBase):
@@ -225,3 +244,17 @@ class AssignedCallSuggestion(BaseModel):
     suggested_calls: Optional[list[dict]] = None
     legs: Optional[list[dict]] = None
     snooze_until: Optional[date] = None
+
+
+class ClosedCycleResponse(BaseModel):
+    position_id: int
+    symbol: str
+    closed_at: Optional[datetime] = None
+    capital_initial: float
+    total_premiums: float
+    delivery_price: Optional[float] = None
+    pnl_total: float
+    pnl_pct: float
+    duration_days: Optional[int] = None
+    legs: Optional[list[dict]] = None
+    contracts: int
