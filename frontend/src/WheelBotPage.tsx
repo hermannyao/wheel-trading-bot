@@ -12,6 +12,7 @@ import type {
   Signal,
   Position,
   PositionStatus,
+  AssignedCallSuggestion,
 } from "./types";
 
 const FILTERS = ["all", "safe", "high", "under2k"] as const;
@@ -152,6 +153,11 @@ function WheelBotPage() {
   const positionsQuery = useQuery<Position[]>({
     queryKey: ["positions"],
     queryFn: async () => (await apiClient.get("/api/positions")).data,
+  });
+
+  const assignedCallsQuery = useQuery<AssignedCallSuggestion[]>({
+    queryKey: ["assigned-calls"],
+    queryFn: async () => (await apiClient.get("/api/positions/assigned-calls")).data,
   });
 
   const marketQuery = useQuery<MarketStatusResponse>({
@@ -426,7 +432,10 @@ function WheelBotPage() {
             min_iv: minIvValue,
             min_apr: minAprValue,
           });
-          await queryClient.invalidateQueries({ queryKey: ["scan-history"] });
+          await Promise.all([
+            queryClient.invalidateQueries({ queryKey: ["scan-history"] }),
+            queryClient.invalidateQueries({ queryKey: ["assigned-calls"] }),
+          ]);
           setProgressStats(null);
           setScanMessage("");
           contentRef.current?.scrollTo({ top: 0, behavior: "smooth" });
@@ -1342,6 +1351,78 @@ function WheelBotPage() {
                 <div className="stat-value yellow">{formatMoney(positionsSummary.realized)}</div>
               </div>
             </div>
+
+            <div className="info-card">
+              <div className="section-title">Positions assignées</div>
+              {(assignedCallsQuery.data || []).length === 0 ? (
+                <div className="empty-state">Aucune position assignée.</div>
+              ) : (
+                (assignedCallsQuery.data || []).map((item) => (
+                  <div className="assigned-card" key={item.symbol}>
+                    <div className="assigned-header">
+                      <div className="assigned-title">{item.symbol}</div>
+                      <div className="assigned-sub">
+                        Assignée le {new Date(item.assigned_at).toLocaleDateString("fr-FR")}
+                      </div>
+                    </div>
+                    <div className="assigned-grid">
+                      <div>
+                        <span className="ck">Coût initial</span>
+                        <span className="cv">{formatMoney(item.put_strike * 100)}</span>
+                      </div>
+                      <div>
+                        <span className="ck">Coût ajusté</span>
+                        <span className="cv">{formatMoney(item.cost_basis_adjusted * 100)}</span>
+                      </div>
+                      <div>
+                        <span className="ck">Réduction</span>
+                        <span className="cv">{formatPct(item.reduction_pct, 1)}</span>
+                      </div>
+                      <div>
+                        <span className="ck">Spot</span>
+                        <span className="cv">{item.spot_price ? formatMoney(item.spot_price) : "-"}</span>
+                      </div>
+                    </div>
+                    {item.status === "viable" && item.suggested_call ? (
+                      <div className="assigned-call">
+                        <div className="assigned-row">
+                          <span>Strike</span>
+                          <span>{item.suggested_call.strike}</span>
+                        </div>
+                        <div className="assigned-row">
+                          <span>Distance coût de base</span>
+                          <span>
+                            {item.suggested_call.distance_to_basis?.toFixed(2)}$ ·{" "}
+                            {item.suggested_call.distance_to_basis_pct?.toFixed(1)}%
+                          </span>
+                        </div>
+                        <div className="assigned-row">
+                          <span>Prime (bid)</span>
+                          <span>{item.suggested_call.bid?.toFixed(2)}</span>
+                        </div>
+                        <div className="assigned-row">
+                          <span>APR</span>
+                          <span>{formatPct(item.suggested_call.apr ?? 0, 1)}</span>
+                        </div>
+                        <div className="assigned-row">
+                          <span>DTE</span>
+                          <span>{item.suggested_call.dte}j</span>
+                        </div>
+                        <div className="assigned-row">
+                          <span>Gain max cycle</span>
+                          <span>{formatMoney(item.suggested_call.gain_max_cycle ?? 0)}</span>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="assigned-empty">
+                        {item.message || "Aucun Call viable — conserver la position"}
+                      </div>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+
             <div className="table-wrap">
               <table>
                 <thead>
@@ -2026,6 +2107,77 @@ function WheelBotPage() {
                   <div className="stat-value yellow">{formatMoney(positionsSummary.realized)}</div>
                 </div>
               </div>
+            </div>
+
+            <div className="params-section">
+              <div className="section-title">Positions assignées</div>
+              {(assignedCallsQuery.data || []).length === 0 ? (
+                <div className="empty-state">Aucune position assignée.</div>
+              ) : (
+                (assignedCallsQuery.data || []).map((item) => (
+                  <div className="assigned-card" key={item.symbol}>
+                    <div className="assigned-header">
+                      <div className="assigned-title">{item.symbol}</div>
+                      <div className="assigned-sub">
+                        Assignée le {new Date(item.assigned_at).toLocaleDateString("fr-FR")}
+                      </div>
+                    </div>
+                    <div className="assigned-grid">
+                      <div>
+                        <span className="ck">Coût initial</span>
+                        <span className="cv">{formatMoney(item.put_strike * 100)}</span>
+                      </div>
+                      <div>
+                        <span className="ck">Coût ajusté</span>
+                        <span className="cv">{formatMoney(item.cost_basis_adjusted * 100)}</span>
+                      </div>
+                      <div>
+                        <span className="ck">Réduction</span>
+                        <span className="cv">{formatPct(item.reduction_pct, 1)}</span>
+                      </div>
+                      <div>
+                        <span className="ck">Spot</span>
+                        <span className="cv">{item.spot_price ? formatMoney(item.spot_price) : "-"}</span>
+                      </div>
+                    </div>
+                    {item.status === "viable" && item.suggested_call ? (
+                      <div className="assigned-call">
+                        <div className="assigned-row">
+                          <span>Strike</span>
+                          <span>{item.suggested_call.strike}</span>
+                        </div>
+                        <div className="assigned-row">
+                          <span>Distance coût</span>
+                          <span>
+                            {item.suggested_call.distance_to_basis?.toFixed(2)}$ ·{" "}
+                            {item.suggested_call.distance_to_basis_pct?.toFixed(1)}%
+                          </span>
+                        </div>
+                        <div className="assigned-row">
+                          <span>Prime</span>
+                          <span>{item.suggested_call.bid?.toFixed(2)}</span>
+                        </div>
+                        <div className="assigned-row">
+                          <span>APR</span>
+                          <span>{formatPct(item.suggested_call.apr ?? 0, 1)}</span>
+                        </div>
+                        <div className="assigned-row">
+                          <span>DTE</span>
+                          <span>{item.suggested_call.dte}j</span>
+                        </div>
+                        <div className="assigned-row">
+                          <span>Gain max</span>
+                          <span>{formatMoney(item.suggested_call.gain_max_cycle ?? 0)}</span>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="assigned-empty">
+                        {item.message || "Aucun Call viable — conserver la position"}
+                      </div>
+                    )}
+                  </div>
+                ))
+              )}
             </div>
             <div className="signal-list">
               {visiblePositions.map((p) => (

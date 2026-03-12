@@ -241,6 +241,105 @@ def _pick_candidate_put(
     return best
 
 
+def _pick_candidate_call(
+    calls: pd.DataFrame,
+    price: float,
+    cost_basis: float,
+    min_otm_pct: float = 0.03,
+    max_otm_pct: float = 0.08,
+) -> dict | None:
+    if calls is None or calls.empty:
+        return None
+    calls = calls.copy()
+    calls["otm_pct"] = (calls["strike"] - price) / price
+    candidates = calls[
+        (calls["strike"] >= cost_basis)
+        & (calls["otm_pct"] >= min_otm_pct)
+        & (calls["otm_pct"] <= max_otm_pct)
+    ].copy()
+    if candidates.empty:
+        return None
+    target = (min_otm_pct + max_otm_pct) / 2
+    candidates["score"] = (candidates["otm_pct"] - target).abs()
+    candidates = candidates.sort_values(["score", "strike"]).reset_index(drop=True)
+    return candidates.iloc[0].to_dict()
+
+
+def scan_covered_call(
+    symbol: str,
+    price: float,
+    cost_basis: float,
+    contracts: int,
+    overrides: dict,
+) -> dict | None:
+    try:
+        min_dte = overrides.get("min_dte", MIN_DTE)
+        max_dte = overrides.get("max_dte", MAX_DTE)
+        min_iv = overrides.get("min_iv", MIN_IV)
+        min_apr = overrides.get("min_apr", MIN_APR)
+        min_open_interest = overrides.get("min_open_interest", MIN_OPEN_INTEREST)
+        max_spread_pct = overrides.get("max_spread_pct", MAX_SPREAD_PCT)
+
+        ticker = yf.Ticker(symbol)
+        expiration, dte = _select_expiration(ticker.options, min_dte, max_dte)
+        if not expiration or not dte:
+            return None
+        chain = ticker.option_chain(expiration)
+        call = _pick_candidate_call(chain.calls, price, cost_basis)
+        if not call:
+            return None
+
+        strike = float(call.get("strike"))
+        bid = float(call.get("bid") or 0)
+        ask = float(call.get("ask") or 0)
+        volume = call.get("volume")
+        if bid <= 0 or (volume is None or volume <= 0):
+            return None
+        premium = bid if bid > 0 else ask
+        iv = call.get("impliedVolatility")
+        open_interest = call.get("openInterest")
+        spread = abs(ask - bid) if ask and bid else None
+        spread_pct = (spread / bid) if spread is not None and bid > 0 else None
+        if iv is None or iv < min_iv:
+            return None
+        if open_interest is None or int(open_interest) < min_open_interest:
+            return None
+        if spread_pct is None or spread_pct > max_spread_pct:
+            return None
+
+        apr = _calc_apr(premium, strike, dte) if bid > 0 and ask > 0 else None
+        if apr is None or apr < min_apr:
+            return None
+
+        distance_to_basis = strike - cost_basis
+        distance_to_basis_pct = (distance_to_basis / cost_basis) * 100 if cost_basis else 0
+        otm_pct = ((strike - price) / price) * 100 if price else 0
+        contract_price = round(premium * 100, 2) if bid > 0 and ask > 0 else None
+        max_profit = round(contract_price * contracts, 2) if contract_price is not None else None
+
+        return {
+            "symbol": symbol,
+            "price": round(price, 2),
+            "strike": round(strike, 2),
+            "dte": dte,
+            "bid": bid if bid > 0 else None,
+            "ask": ask if ask > 0 else None,
+            "iv": round(float(iv), 4) if iv is not None else None,
+            "openInterest": int(open_interest) if open_interest is not None else None,
+            "volume": int(volume) if volume is not None else None,
+            "spread": round(spread, 4) if spread is not None else None,
+            "apr": apr,
+            "contract_price": contract_price,
+            "max_profit": max_profit,
+            "distance_to_basis": round(distance_to_basis, 2),
+            "distance_to_basis_pct": round(distance_to_basis_pct, 2),
+            "otm_pct": round(otm_pct, 2),
+            "expiration": expiration,
+        }
+    except Exception:
+        return None
+
+
 def _status_from_metrics(
     apr: float | None,
     iv: float | None,

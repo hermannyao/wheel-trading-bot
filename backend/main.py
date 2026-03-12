@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 import yfinance as yf
 import pandas_market_calendars as mcal
+from scanner import scan_covered_call, fetch_prices_bulk
 
 from database import Signal, ScanHistory, SignalHistory, Alert, Position, get_db, init_db
 from application.position_service import PositionService
@@ -51,6 +52,7 @@ from schemas import (
     PositionResponse,
     ScanRunResponse,
     ScanResultsResponse,
+    AssignedCallSuggestion,
 )
 from logging_config import setup_logging
 
@@ -479,6 +481,101 @@ async def export_positions(db: Session = Depends(get_db)):
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=positions.csv"},
     )
+
+
+@app.get("/api/positions/assigned-calls", response_model=List[AssignedCallSuggestion])
+async def get_assigned_calls(db: Session = Depends(get_db)):
+    positions = (
+        db.query(Position)
+        .filter(Position.status == "ASSIGNED")
+        .order_by(desc(Position.assigned_at))
+        .all()
+    )
+    if not positions:
+        return []
+
+    symbols = [p.symbol for p in positions]
+    prices = fetch_prices_bulk(symbols)
+    suggestions: list[dict] = []
+    for p in positions:
+        total_premiums = p.premium_received or 0
+        cost_basis_adjusted = (p.strike or 0) - total_premiums
+        reduction_pct = (
+            (total_premiums / p.strike) * 100 if p.strike else 0
+        )
+        price = prices.get(p.symbol)
+        if not price:
+            suggestions.append({
+                "symbol": p.symbol,
+                "assigned_at": p.assigned_at,
+                "put_strike": p.strike,
+                "contracts": p.contracts,
+                "shares": p.contracts * 100,
+                "premium_put": p.premium_received,
+                "total_premiums": total_premiums,
+                "cost_basis_adjusted": round(cost_basis_adjusted, 2),
+                "reduction_pct": round(reduction_pct, 2),
+                "spot_price": None,
+                "status": "no_price",
+                "message": "Prix spot indisponible",
+                "suggested_call": None,
+            })
+            continue
+
+        call = scan_covered_call(
+            symbol=p.symbol,
+            price=price,
+            cost_basis=cost_basis_adjusted,
+            contracts=p.contracts,
+            overrides={
+                "min_dte": MIN_DTE,
+                "max_dte": MAX_DTE,
+                "min_iv": MIN_IV,
+                "min_apr": MIN_APR,
+                "min_open_interest": MIN_OPEN_INTEREST,
+                "max_spread_pct": MAX_SPREAD_PCT,
+            },
+        )
+        if call:
+            gain_max_cycle = round(
+                (call["strike"] - cost_basis_adjusted) * 100 * p.contracts, 2
+            )
+            call["gain_max_cycle"] = gain_max_cycle
+            call["call_premium"] = call.get("bid")
+            suggestions.append({
+                "symbol": p.symbol,
+                "assigned_at": p.assigned_at,
+                "put_strike": p.strike,
+                "contracts": p.contracts,
+                "shares": p.contracts * 100,
+                "premium_put": p.premium_received,
+                "total_premiums": total_premiums,
+                "cost_basis_adjusted": round(cost_basis_adjusted, 2),
+                "reduction_pct": round(reduction_pct, 2),
+                "spot_price": round(price, 2),
+                "status": "viable",
+                "message": None,
+                "suggested_call": call,
+            })
+        else:
+            next_review = datetime.utcnow().date().isoformat()
+            suggestions.append({
+                "symbol": p.symbol,
+                "assigned_at": p.assigned_at,
+                "put_strike": p.strike,
+                "contracts": p.contracts,
+                "shares": p.contracts * 100,
+                "premium_put": p.premium_received,
+                "total_premiums": total_premiums,
+                "cost_basis_adjusted": round(cost_basis_adjusted, 2),
+                "reduction_pct": round(reduction_pct, 2),
+                "spot_price": round(price, 2),
+                "status": "no_viable_call",
+                "message": f"Aucun Call viable — conserver la position. Réévaluation: {next_review}",
+                "suggested_call": None,
+            })
+
+    return suggestions
 
 
 @app.get("/api/symbol-history/{symbol}", response_model=List[SymbolHistoryResponse])

@@ -204,6 +204,34 @@ input  { font-family:inherit; }
   opacity:0.55;
 }
 
+.assigned-card {
+  background:var(--surface2);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:12px;
+  margin-bottom:10px;
+}
+.assigned-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+.assigned-title { font-weight:700; }
+.assigned-sub { font-size:10px; color:var(--text3); }
+.assigned-grid {
+  display:grid;
+  grid-template-columns:repeat(2,1fr);
+  gap:8px;
+  margin-bottom:10px;
+}
+.assigned-grid > div {
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+}
+.assigned-grid .ck { font-size:9px; color:var(--text3); text-transform:uppercase; letter-spacing:.3px; }
+.assigned-grid .cv { font-size:12px; font-weight:700; color:var(--accent); }
+.assigned-call { border-top:1px solid var(--border); padding-top:8px; display:flex; flex-direction:column; gap:6px; }
+.assigned-row { display:flex; justify-content:space-between; font-size:11px; color:var(--text2); }
+.assigned-row span:last-child { color:var(--text); font-weight:600; }
+.assigned-empty { font-size:11px; color:var(--text3); }
+
 .modal-overlay {
   position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:400;
   display:flex; align-items:center; justify-content:center; padding:20px;

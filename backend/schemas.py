@@ -177,3 +177,19 @@ class AlertResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class AssignedCallSuggestion(BaseModel):
+    symbol: str
+    assigned_at: datetime
+    put_strike: float
+    contracts: int
+    shares: int
+    premium_put: float
+    total_premiums: float
+    cost_basis_adjusted: float
+    reduction_pct: float
+    spot_price: Optional[float] = None
+    status: str
+    message: Optional[str] = None
+    suggested_call: Optional[dict] = None

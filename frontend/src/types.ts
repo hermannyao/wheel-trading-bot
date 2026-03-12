@@ -149,3 +149,28 @@ export interface Position {
   trigger_sell_call?: boolean | null;
   motif_annulation?: string | null;
 }
+
+export interface AssignedCallSuggestion {
+  symbol: string;
+  assigned_at: string;
+  put_strike: number;
+  contracts: number;
+  shares: number;
+  premium_put: number;
+  total_premiums: number;
+  cost_basis_adjusted: number;
+  reduction_pct: number;
+  spot_price?: number | null;
+  status: string;
+  message?: string | null;
+  suggested_call?: {
+    strike: number;
+    dte: number;
+    bid?: number | null;
+    apr?: number | null;
+    distance_to_basis?: number | null;
+    distance_to_basis_pct?: number | null;
+    otm_pct?: number | null;
+    gain_max_cycle?: number | null;
+  } | null;
+}
