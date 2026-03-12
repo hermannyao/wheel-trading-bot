@@ -265,13 +265,13 @@ def _pick_candidate_call(
     return candidates.iloc[0].to_dict()
 
 
-def scan_covered_call(
+def scan_covered_calls(
     symbol: str,
     price: float,
     cost_basis: float,
     contracts: int,
     overrides: dict,
-) -> dict | None:
+) -> list[dict]:
     try:
         min_dte = overrides.get("min_dte", MIN_DTE)
         max_dte = overrides.get("max_dte", MAX_DTE)
@@ -285,59 +285,73 @@ def scan_covered_call(
         if not expiration or not dte:
             return None
         chain = ticker.option_chain(expiration)
-        call = _pick_candidate_call(chain.calls, price, cost_basis)
-        if not call:
-            return None
+        calls_df = chain.calls
+        if calls_df is None or calls_df.empty:
+            return []
+        calls_df = calls_df.copy()
+        calls_df["otm_pct"] = (calls_df["strike"] - price) / price
+        calls_df = calls_df[
+            (calls_df["strike"] >= cost_basis)
+            & (calls_df["otm_pct"] >= 0.03)
+            & (calls_df["otm_pct"] <= 0.08)
+        ].copy()
+        if calls_df.empty:
+            return []
 
-        strike = float(call.get("strike"))
-        bid = float(call.get("bid") or 0)
-        ask = float(call.get("ask") or 0)
-        volume = call.get("volume")
-        if bid <= 0 or (volume is None or volume <= 0):
-            return None
-        premium = bid if bid > 0 else ask
-        iv = call.get("impliedVolatility")
-        open_interest = call.get("openInterest")
-        spread = abs(ask - bid) if ask and bid else None
-        spread_pct = (spread / bid) if spread is not None and bid > 0 else None
-        if iv is None or iv < min_iv:
-            return None
-        if open_interest is None or int(open_interest) < min_open_interest:
-            return None
-        if spread_pct is None or spread_pct > max_spread_pct:
-            return None
+        results: list[dict] = []
+        for _, call in calls_df.iterrows():
+            strike = float(call.get("strike") or 0)
+            bid = float(call.get("bid") or 0)
+            ask = float(call.get("ask") or 0)
+            volume = call.get("volume")
+            if bid <= 0 or (volume is None or volume <= 0):
+                continue
+            premium = bid if bid > 0 else ask
+            iv = call.get("impliedVolatility")
+            open_interest = call.get("openInterest")
+            spread = abs(ask - bid) if ask and bid else None
+            spread_pct = (spread / bid) if spread is not None and bid > 0 else None
+            if iv is None or iv < min_iv:
+                continue
+            if open_interest is None or int(open_interest) < min_open_interest:
+                continue
+            if spread_pct is None or spread_pct > max_spread_pct:
+                continue
 
-        apr = _calc_apr(premium, strike, dte) if bid > 0 and ask > 0 else None
-        if apr is None or apr < min_apr:
-            return None
+            apr = _calc_apr(premium, strike, dte) if bid > 0 and ask > 0 else None
+            if apr is None or apr < min_apr:
+                continue
 
-        distance_to_basis = strike - cost_basis
-        distance_to_basis_pct = (distance_to_basis / cost_basis) * 100 if cost_basis else 0
-        otm_pct = ((strike - price) / price) * 100 if price else 0
-        contract_price = round(premium * 100, 2) if bid > 0 and ask > 0 else None
-        max_profit = round(contract_price * contracts, 2) if contract_price is not None else None
+            distance_to_basis = strike - cost_basis
+            distance_to_basis_pct = (distance_to_basis / cost_basis) * 100 if cost_basis else 0
+            otm_pct = ((strike - price) / price) * 100 if price else 0
+            contract_price = round(premium * 100, 2) if bid > 0 and ask > 0 else None
+            max_profit = round(contract_price * contracts, 2) if contract_price is not None else None
 
-        return {
-            "symbol": symbol,
-            "price": round(price, 2),
-            "strike": round(strike, 2),
-            "dte": dte,
-            "bid": bid if bid > 0 else None,
-            "ask": ask if ask > 0 else None,
-            "iv": round(float(iv), 4) if iv is not None else None,
-            "openInterest": int(open_interest) if open_interest is not None else None,
-            "volume": int(volume) if volume is not None else None,
-            "spread": round(spread, 4) if spread is not None else None,
-            "apr": apr,
-            "contract_price": contract_price,
-            "max_profit": max_profit,
-            "distance_to_basis": round(distance_to_basis, 2),
-            "distance_to_basis_pct": round(distance_to_basis_pct, 2),
-            "otm_pct": round(otm_pct, 2),
-            "expiration": expiration,
-        }
+            results.append({
+                "symbol": symbol,
+                "price": round(price, 2),
+                "strike": round(strike, 2),
+                "dte": dte,
+                "bid": bid if bid > 0 else None,
+                "ask": ask if ask > 0 else None,
+                "iv": round(float(iv), 4) if iv is not None else None,
+                "openInterest": int(open_interest) if open_interest is not None else None,
+                "volume": int(volume) if volume is not None else None,
+                "spread": round(spread, 4) if spread is not None else None,
+                "apr": apr,
+                "contract_price": contract_price,
+                "max_profit": max_profit,
+                "distance_to_basis": round(distance_to_basis, 2),
+                "distance_to_basis_pct": round(distance_to_basis_pct, 2),
+                "otm_pct": round(otm_pct, 2),
+                "expiration": expiration,
+            })
+
+        results.sort(key=lambda x: x.get("apr") or 0, reverse=True)
+        return results[:3]
     except Exception:
-        return None
+        return []
 
 
 def _status_from_metrics(

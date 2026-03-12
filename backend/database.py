@@ -124,6 +124,22 @@ class Position(Base):
     expires_soon = Column(Boolean, default=False)
     trigger_sell_call = Column(Boolean, default=False)
     motif_annulation = Column(String, nullable=True)
+    snooze_until = Column(Date, nullable=True)
+
+
+class PositionLeg(Base):
+    """Represents a leg within a Wheel cycle."""
+    __tablename__ = "position_legs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    position_id = Column(Integer, ForeignKey("positions.id"), index=True)
+    leg_type = Column(String, nullable=False)  # SELL PUT / SELL CALL
+    strike = Column(Float, nullable=False)
+    premium_received = Column(Float, nullable=False)
+    dte = Column(Integer, nullable=True)
+    expiration_date = Column(Date, nullable=True)
+    opened_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    status = Column(String, nullable=False, default="OPEN")  # OPEN / CLOSED / EXPIRED
 
 
 class Alert(Base):

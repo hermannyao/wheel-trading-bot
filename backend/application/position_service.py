@@ -9,7 +9,7 @@ from domain.position import (
     ALLOWED_TRANSITIONS,
     calc_position_fields,
 )
-from database import Position
+from database import Position, PositionLeg
 
 
 class PositionService:
@@ -43,6 +43,18 @@ class PositionService:
         self.db.add(position)
         self.db.commit()
         self.db.refresh(position)
+        leg = PositionLeg(
+            position_id=position.id,
+            leg_type=position.position_type,
+            strike=position.strike,
+            premium_received=position.premium_received,
+            dte=position.dte_open,
+            expiration_date=position.expiration_date,
+            opened_at=position.opened_at,
+            status="OPEN",
+        )
+        self.db.add(leg)
+        self.db.commit()
         return position
 
     def update_position(self, position_id: int, payload):
@@ -95,3 +107,59 @@ class PositionService:
             status_code=410,
             detail="Delete disabled. Use cancellation with motif instead.",
         )
+
+    def list_legs(self, position_id: int):
+        return (
+            self.db.query(PositionLeg)
+            .filter(PositionLeg.position_id == position_id)
+            .order_by(PositionLeg.opened_at.asc())
+            .all()
+        )
+
+    def create_leg(self, position_id: int, payload):
+        position = self.db.query(Position).filter(Position.id == position_id).first()
+        if not position:
+            raise HTTPException(status_code=404, detail="Position not found")
+        if position.status != "ASSIGNED":
+            raise HTTPException(status_code=409, detail="Only ASSIGNED positions can add call legs")
+        if payload.leg_type not in {"SELL CALL"}:
+            raise HTTPException(status_code=422, detail="Invalid leg_type")
+        existing_open = (
+            self.db.query(PositionLeg)
+            .filter(
+                PositionLeg.position_id == position_id,
+                PositionLeg.leg_type == "SELL CALL",
+                PositionLeg.status == "OPEN",
+            )
+            .first()
+        )
+        if existing_open:
+            raise HTTPException(
+                status_code=409,
+                detail="Un Call est déjà ouvert sur ce cycle.",
+            )
+        leg = PositionLeg(
+            position_id=position_id,
+            leg_type=payload.leg_type,
+            strike=payload.strike,
+            premium_received=payload.premium_received,
+            dte=payload.dte,
+            expiration_date=payload.expiration_date,
+            opened_at=payload.opened_at or datetime.now(timezone.utc),
+            status="OPEN",
+        )
+        self.db.add(leg)
+        self.db.commit()
+        self.db.refresh(leg)
+        return leg
+
+    def snooze_position(self, position_id: int, snooze_until):
+        position = self.db.query(Position).filter(Position.id == position_id).first()
+        if not position:
+            raise HTTPException(status_code=404, detail="Position not found")
+        if position.status != "ASSIGNED":
+            raise HTTPException(status_code=409, detail="Only ASSIGNED positions can be snoozed")
+        position.snooze_until = snooze_until
+        self.db.commit()
+        self.db.refresh(position)
+        return position

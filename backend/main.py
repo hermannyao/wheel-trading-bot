@@ -17,9 +17,9 @@ from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 import yfinance as yf
 import pandas_market_calendars as mcal
-from scanner import scan_covered_call, fetch_prices_bulk
+from scanner import scan_covered_calls, fetch_prices_bulk
 
-from database import Signal, ScanHistory, SignalHistory, Alert, Position, get_db, init_db
+from database import Signal, ScanHistory, SignalHistory, Alert, Position, PositionLeg, get_db, init_db
 from application.position_service import PositionService
 from infrastructure.scan_runner import ScanRunner
 from config import (
@@ -53,6 +53,8 @@ from schemas import (
     ScanRunResponse,
     ScanResultsResponse,
     AssignedCallSuggestion,
+    PositionLegCreate,
+    PositionLegResponse,
 )
 from logging_config import setup_logging
 
@@ -422,6 +424,68 @@ async def delete_position(position_id: int, db: Session = Depends(get_db)):
     return service.delete_position(position_id)
 
 
+@app.get("/api/positions/{position_id}/legs", response_model=List[PositionLegResponse])
+async def list_position_legs(position_id: int, db: Session = Depends(get_db)):
+    service = PositionService(db)
+    return service.list_legs(position_id)
+
+
+@app.post("/api/positions/{position_id}/legs", response_model=PositionLegResponse)
+async def create_position_leg(position_id: int, payload: PositionLegCreate, db: Session = Depends(get_db)):
+    service = PositionService(db)
+    return service.create_leg(position_id, payload)
+
+
+@app.get("/api/positions/{position_id}/legs/export")
+async def export_position_legs(position_id: int, db: Session = Depends(get_db)):
+    import csv
+    import io
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "position_id",
+        "leg_type",
+        "strike",
+        "premium_received",
+        "opened_at",
+        "expiration_date",
+        "status",
+    ])
+    legs = (
+        db.query(PositionLeg)
+        .filter(PositionLeg.position_id == position_id)
+        .order_by(PositionLeg.opened_at.asc())
+        .all()
+    )
+    for l in legs:
+        writer.writerow([
+            l.position_id,
+            l.leg_type,
+            l.strike,
+            l.premium_received,
+            l.opened_at,
+            l.expiration_date,
+            l.status,
+        ])
+    output.seek(0)
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=position_{position_id}_legs.csv"},
+    )
+
+
+@app.post("/api/positions/{position_id}/snooze", response_model=PositionResponse)
+async def snooze_position(position_id: int, snooze_until: str, db: Session = Depends(get_db)):
+    service = PositionService(db)
+    try:
+        date_value = datetime.fromisoformat(snooze_until).date()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid snooze_until date")
+    return service.snooze_position(position_id, date_value)
+
+
 @app.get("/api/positions/export")
 async def export_positions(db: Session = Depends(get_db)):
     import csv
@@ -498,14 +562,55 @@ async def get_assigned_calls(db: Session = Depends(get_db)):
     prices = fetch_prices_bulk(symbols)
     suggestions: list[dict] = []
     for p in positions:
-        total_premiums = p.premium_received or 0
+        legs = (
+            db.query(PositionLeg)
+            .filter(PositionLeg.position_id == p.id)
+            .order_by(PositionLeg.opened_at.asc())
+            .all()
+        )
+        legs_payload = [
+            {
+                "leg_type": l.leg_type,
+                "strike": l.strike,
+                "premium_received": l.premium_received,
+                "opened_at": l.opened_at,
+                "expiration_date": l.expiration_date,
+                "status": l.status,
+            }
+            for l in legs
+        ]
+        total_premiums = (p.premium_received or 0) + sum(
+            l.premium_received for l in legs if l.leg_type == "SELL CALL"
+        )
         cost_basis_adjusted = (p.strike or 0) - total_premiums
         reduction_pct = (
             (total_premiums / p.strike) * 100 if p.strike else 0
         )
         price = prices.get(p.symbol)
+        today = datetime.utcnow().date()
+        if p.snooze_until and p.snooze_until >= today:
+            suggestions.append({
+                "position_id": p.id,
+                "symbol": p.symbol,
+                "assigned_at": p.assigned_at,
+                "put_strike": p.strike,
+                "contracts": p.contracts,
+                "shares": p.contracts * 100,
+                "premium_put": p.premium_received,
+                "total_premiums": total_premiums,
+                "cost_basis_adjusted": round(cost_basis_adjusted, 2),
+                "reduction_pct": round(reduction_pct, 2),
+                "spot_price": round(price, 2) if price else None,
+                "status": "snoozed",
+                "message": f"Snoozée jusqu'au {p.snooze_until.isoformat()}",
+                "suggested_calls": None,
+                "legs": legs_payload,
+                "snooze_until": p.snooze_until,
+            })
+            continue
         if not price:
             suggestions.append({
+                "position_id": p.id,
                 "symbol": p.symbol,
                 "assigned_at": p.assigned_at,
                 "put_strike": p.strike,
@@ -518,11 +623,34 @@ async def get_assigned_calls(db: Session = Depends(get_db)):
                 "spot_price": None,
                 "status": "no_price",
                 "message": "Prix spot indisponible",
-                "suggested_call": None,
+                "suggested_calls": None,
+                "legs": legs_payload,
+                "snooze_until": p.snooze_until,
             })
             continue
 
-        call = scan_covered_call(
+        if not (0.5 * p.strike <= price <= 5 * p.strike):
+            suggestions.append({
+                "position_id": p.id,
+                "symbol": p.symbol,
+                "assigned_at": p.assigned_at,
+                "put_strike": p.strike,
+                "contracts": p.contracts,
+                "shares": p.contracts * 100,
+                "premium_put": p.premium_received,
+                "total_premiums": total_premiums,
+                "cost_basis_adjusted": round(cost_basis_adjusted, 2),
+                "reduction_pct": round(reduction_pct, 2),
+                "spot_price": round(price, 2),
+                "status": "spot_incoherent",
+                "message": f"Spot {price} incohérent avec strike {p.strike}",
+                "suggested_calls": None,
+                "legs": legs_payload,
+                "snooze_until": p.snooze_until,
+            })
+            continue
+
+        calls = scan_covered_calls(
             symbol=p.symbol,
             price=price,
             cost_basis=cost_basis_adjusted,
@@ -536,13 +664,15 @@ async def get_assigned_calls(db: Session = Depends(get_db)):
                 "max_spread_pct": MAX_SPREAD_PCT,
             },
         )
-        if call:
-            gain_max_cycle = round(
-                (call["strike"] - cost_basis_adjusted) * 100 * p.contracts, 2
-            )
-            call["gain_max_cycle"] = gain_max_cycle
-            call["call_premium"] = call.get("bid")
+        if calls:
+            for call in calls:
+                gain_max_cycle = round(
+                    (call["strike"] - cost_basis_adjusted) * 100 * p.contracts, 2
+                )
+                call["gain_max_cycle"] = gain_max_cycle
+                call["call_premium"] = call.get("bid")
             suggestions.append({
+                "position_id": p.id,
                 "symbol": p.symbol,
                 "assigned_at": p.assigned_at,
                 "put_strike": p.strike,
@@ -555,11 +685,14 @@ async def get_assigned_calls(db: Session = Depends(get_db)):
                 "spot_price": round(price, 2),
                 "status": "viable",
                 "message": None,
-                "suggested_call": call,
+                "suggested_calls": calls,
+                "legs": legs_payload,
+                "snooze_until": p.snooze_until,
             })
         else:
             next_review = datetime.utcnow().date().isoformat()
             suggestions.append({
+                "position_id": p.id,
                 "symbol": p.symbol,
                 "assigned_at": p.assigned_at,
                 "put_strike": p.strike,
@@ -572,7 +705,9 @@ async def get_assigned_calls(db: Session = Depends(get_db)):
                 "spot_price": round(price, 2),
                 "status": "no_viable_call",
                 "message": f"Aucun Call viable — conserver la position. Réévaluation: {next_review}",
-                "suggested_call": None,
+                "suggested_calls": None,
+                "legs": legs_payload,
+                "snooze_until": p.snooze_until,
             })
 
     return suggestions

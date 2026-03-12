@@ -63,6 +63,7 @@ class PositionBase(BaseModel):
     expires_soon: Optional[bool] = None
     trigger_sell_call: Optional[bool] = None
     motif_annulation: Optional[str] = None
+    snooze_until: Optional[date] = None
 
 
 class PositionCreate(BaseModel):
@@ -83,6 +84,34 @@ class PositionUpdate(BaseModel):
     expired_at: Optional[datetime] = None
     assigned_at: Optional[datetime] = None
     motif_annulation: Optional[str] = None
+    snooze_until: Optional[date] = None
+
+
+class PositionLegBase(BaseModel):
+    position_id: int
+    leg_type: str
+    strike: float
+    premium_received: float
+    dte: Optional[int] = None
+    expiration_date: Optional[date] = None
+    opened_at: Optional[datetime] = None
+    status: Optional[str] = "OPEN"
+
+
+class PositionLegCreate(BaseModel):
+    leg_type: str
+    strike: float
+    premium_received: float
+    dte: Optional[int] = None
+    expiration_date: Optional[date] = None
+    opened_at: Optional[datetime] = None
+
+
+class PositionLegResponse(PositionLegBase):
+    id: int
+
+    class Config:
+        from_attributes = True
 
 
 class PositionResponse(PositionBase):
@@ -180,6 +209,7 @@ class AlertResponse(BaseModel):
 
 
 class AssignedCallSuggestion(BaseModel):
+    position_id: int
     symbol: str
     assigned_at: datetime
     put_strike: float
@@ -192,4 +222,6 @@ class AssignedCallSuggestion(BaseModel):
     spot_price: Optional[float] = None
     status: str
     message: Optional[str] = None
-    suggested_call: Optional[dict] = None
+    suggested_calls: Optional[list[dict]] = None
+    legs: Optional[list[dict]] = None
+    snooze_until: Optional[date] = None
