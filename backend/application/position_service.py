@@ -50,6 +50,9 @@ class PositionService:
         if not position:
             raise HTTPException(status_code=404, detail="Position not found")
 
+        if position.status == "CANCELLED":
+            raise HTTPException(status_code=409, detail="Cancelled positions are immutable")
+
         if payload.status not in POSITION_STATUSES:
             raise HTTPException(status_code=422, detail="Invalid status")
 
@@ -60,7 +63,14 @@ class PositionService:
         if payload.status not in allowed:
             raise HTTPException(status_code=409, detail="Invalid status transition")
 
-        if payload.status == "CLOSED_EARLY":
+        if payload.status == "CANCELLED":
+            if payload.motif_annulation not in {"erreur_de_saisie", "trade_non_execute"}:
+                raise HTTPException(
+                    status_code=422,
+                    detail="motif_annulation required (erreur_de_saisie or trade_non_execute)",
+                )
+            position.motif_annulation = payload.motif_annulation
+        elif payload.status == "CLOSED_EARLY":
             if not payload.closed_at or payload.close_price is None:
                 raise HTTPException(status_code=422, detail="closed_at and close_price required")
             position.closed_at = payload.closed_at
@@ -81,11 +91,7 @@ class PositionService:
         return position
 
     def delete_position(self, position_id: int):
-        position = self.db.query(Position).filter(Position.id == position_id).first()
-        if not position:
-            raise HTTPException(status_code=404, detail="Position not found")
-        if position.status != "OPEN":
-            raise HTTPException(status_code=409, detail="Only OPEN positions can be deleted")
-        self.db.delete(position)
-        self.db.commit()
-        return {"status": "deleted"}
+        raise HTTPException(
+            status_code=410,
+            detail="Delete disabled. Use cancellation with motif instead.",
+        )

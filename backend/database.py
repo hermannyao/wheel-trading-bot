@@ -123,6 +123,7 @@ class Position(Base):
     days_to_expiration = Column(Integer, nullable=True)
     expires_soon = Column(Boolean, default=False)
     trigger_sell_call = Column(Boolean, default=False)
+    motif_annulation = Column(String, nullable=True)
 
 
 class Alert(Base):

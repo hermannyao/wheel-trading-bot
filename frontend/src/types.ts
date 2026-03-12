@@ -124,7 +124,8 @@ export type PositionStatus =
   | "OPEN"
   | "CLOSED_EARLY"
   | "EXPIRED_WORTHLESS"
-  | "ASSIGNED";
+  | "ASSIGNED"
+  | "CANCELLED";
 
 export interface Position {
   id: number;
@@ -146,4 +147,5 @@ export interface Position {
   days_to_expiration?: number | null;
   expires_soon?: boolean | null;
   trigger_sell_call?: boolean | null;
+  motif_annulation?: string | null;
 }

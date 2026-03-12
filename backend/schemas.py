@@ -62,6 +62,7 @@ class PositionBase(BaseModel):
     days_to_expiration: Optional[int] = None
     expires_soon: Optional[bool] = None
     trigger_sell_call: Optional[bool] = None
+    motif_annulation: Optional[str] = None
 
 
 class PositionCreate(BaseModel):
@@ -81,6 +82,7 @@ class PositionUpdate(BaseModel):
     close_price: Optional[float] = None
     expired_at: Optional[datetime] = None
     assigned_at: Optional[datetime] = None
+    motif_annulation: Optional[str] = None
 
 
 class PositionResponse(PositionBase):

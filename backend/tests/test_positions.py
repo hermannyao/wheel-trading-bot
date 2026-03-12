@@ -95,4 +95,39 @@ def test_delete_only_open():
     client = make_client()
     pos = create_open_position(client)
     res = client.delete(f"/api/positions/{pos['id']}")
+    assert res.status_code == 410
+
+
+def test_cancel_requires_reason():
+    client = make_client()
+    pos = create_open_position(client)
+    res = client.patch(f"/api/positions/{pos['id']}", json={'status': 'CANCELLED'})
+    assert res.status_code == 422
+
+
+def test_cancel_from_open_success():
+    client = make_client()
+    pos = create_open_position(client)
+    payload = {'status': 'CANCELLED', 'motif_annulation': 'erreur_de_saisie'}
+    res = client.patch(f"/api/positions/{pos['id']}", json=payload)
     assert res.status_code == 200
+    data = res.json()
+    assert data['status'] == 'CANCELLED'
+    assert data['motif_annulation'] == 'erreur_de_saisie'
+
+
+def test_cancel_not_allowed_from_closed():
+    client = make_client()
+    pos = create_open_position(client)
+    payload = {
+        'status': 'CLOSED_EARLY',
+        'closed_at': datetime.utcnow().isoformat(),
+        'close_price': 0.2,
+    }
+    res = client.patch(f"/api/positions/{pos['id']}", json=payload)
+    assert res.status_code == 200
+    res2 = client.patch(
+        f"/api/positions/{pos['id']}",
+        json={'status': 'CANCELLED', 'motif_annulation': 'trade_non_execute'},
+    )
+    assert res2.status_code == 409

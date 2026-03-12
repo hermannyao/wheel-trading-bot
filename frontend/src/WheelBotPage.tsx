@@ -99,6 +99,10 @@ function WheelBotPage() {
   );
   const [positionModalOpen, setPositionModalOpen] = useState(false);
   const [positionUpdateOpen, setPositionUpdateOpen] = useState(false);
+  const [cancelModalOpen, setCancelModalOpen] = useState(false);
+  const [cancelReason, setCancelReason] = useState("");
+  const [cancelTarget, setCancelTarget] = useState<Position | null>(null);
+  const [showCancelled, setShowCancelled] = useState(false);
   const [positionDraft, setPositionDraft] = useState({
     symbol: "",
     position_type: "SELL PUT",
@@ -235,6 +239,7 @@ function WheelBotPage() {
       close_price?: number;
       expired_at?: string;
       assigned_at?: string;
+      motif_annulation?: string;
     }) => {
       const { id, ...rest } = payload;
       await apiClient.patch(`/api/positions/${id}`, rest);
@@ -242,15 +247,6 @@ function WheelBotPage() {
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["positions"] });
       setPositionUpdateOpen(false);
-    },
-  });
-
-  const deletePositionMutation = useMutation({
-    mutationFn: async (id: number) => {
-      await apiClient.delete(`/api/positions/${id}`);
-    },
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["positions"] });
     },
   });
 
@@ -565,16 +561,17 @@ function WheelBotPage() {
 
   const positions = positionsQuery.data || [];
   const positionsSummary = useMemo(() => {
-    const openPositions = positions.filter((p) => p.status === "OPEN");
+    const activePositions = positions.filter((p) => p.status !== "CANCELLED");
+    const openPositions = activePositions.filter((p) => p.status === "OPEN");
     const capital = openPositions.reduce(
       (sum, p) => sum + (p.capital_required || 0),
       0,
     );
-    const premiums = positions.reduce(
+    const premiums = activePositions.reduce(
       (sum, p) => sum + p.premium_received * 100 * p.contracts,
       0,
     );
-    const realized = positions
+    const realized = activePositions
       .filter((p) => p.status !== "OPEN")
       .reduce((sum, p) => sum + (p.pnl_net || 0), 0);
     return { capital, premiums, realized };
@@ -586,6 +583,7 @@ function WheelBotPage() {
     if (p.status === "CLOSED_EARLY") return "Clôturée anticipée";
     if (p.status === "EXPIRED_WORTHLESS") return "Expirée worthless";
     if (p.status === "ASSIGNED") return "Assignée";
+    if (p.status === "CANCELLED") return "Annulée";
     return p.status;
   };
 
@@ -595,6 +593,11 @@ function WheelBotPage() {
     if (p.status === "OPEN") return "pos-badge blue";
     return "pos-badge gray";
   };
+
+  const visiblePositions = useMemo(() => {
+    if (showCancelled) return positions;
+    return positions.filter((p) => p.status !== "CANCELLED");
+  }, [positions, showCancelled]);
 
   const openCreatePosition = (s: Signal) => {
     const fallbackExp = s.dte
@@ -619,6 +622,12 @@ function WheelBotPage() {
     setPositionActionDate(new Date().toISOString().slice(0, 16));
     setPositionClosePrice("");
     setPositionUpdateOpen(true);
+  };
+
+  const openCancelPosition = (p: Position) => {
+    setCancelTarget(p);
+    setCancelReason("");
+    setCancelModalOpen(true);
   };
 
   const updateDraftField = (field: keyof typeof positionDraft, value: any) => {
@@ -650,6 +659,16 @@ function WheelBotPage() {
       payload.assigned_at = positionActionDate ? new Date(positionActionDate).toISOString() : null;
     }
     updatePositionMutation.mutate(payload);
+  };
+
+  const submitCancelPosition = () => {
+    if (!cancelTarget || !cancelReason) return;
+    updatePositionMutation.mutate({
+      id: cancelTarget.id,
+      status: "CANCELLED",
+      motif_annulation: cancelReason,
+    });
+    setCancelModalOpen(false);
   };
 
   const onRunScan = handleSubmit((data) => scanMutation.mutate(data));
@@ -1293,6 +1312,14 @@ function WheelBotPage() {
           <div className="positions-view">
             <div className="table-header-bar">
               <div className="table-title">Mes positions</div>
+              <label className="toggle">
+                <input
+                  type="checkbox"
+                  checked={showCancelled}
+                  onChange={(e) => setShowCancelled(e.target.checked)}
+                />
+                <span>Afficher les positions annulées</span>
+              </label>
               <button
                 className="chip"
                 type="button"
@@ -1332,8 +1359,8 @@ function WheelBotPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {positions.map((p) => (
-                    <tr key={p.id}>
+                  {visiblePositions.map((p) => (
+                    <tr key={p.id} className={p.status === "CANCELLED" ? "row-cancelled" : ""}>
                       <td>{p.symbol}</td>
                       <td>{p.position_type}</td>
                       <td><span className={positionStatusClass(p)}>{positionStatusLabel(p)}</span></td>
@@ -1352,13 +1379,9 @@ function WheelBotPage() {
                             <button
                               className="chip"
                               type="button"
-                              onClick={() => {
-                                if (window.confirm("Supprimer cette position ouverte ?")) {
-                                  deletePositionMutation.mutate(p.id);
-                                }
-                              }}
+                              onClick={() => openCancelPosition(p)}
                             >
-                              Supprimer
+                              Annuler la position
                             </button>
                           </div>
                         ) : (
@@ -1981,6 +2004,14 @@ function WheelBotPage() {
           >
             <div className="params-section">
               <div className="section-title">Mes positions</div>
+              <label className="toggle">
+                <input
+                  type="checkbox"
+                  checked={showCancelled}
+                  onChange={(e) => setShowCancelled(e.target.checked)}
+                />
+                <span>Afficher les positions annulées</span>
+              </label>
               <div className="stats-strip">
                 <div className="stat-card">
                   <div className="stat-label">Capital</div>
@@ -1997,8 +2028,8 @@ function WheelBotPage() {
               </div>
             </div>
             <div className="signal-list">
-              {positions.map((p) => (
-                <div className="signal-card" key={p.id}>
+              {visiblePositions.map((p) => (
+                <div className={`signal-card ${p.status === "CANCELLED" ? "row-cancelled" : ""}`} key={p.id}>
                   <div className="card-top">
                     <div className="card-left">
                       <span className="ticker">{p.symbol}</span>
@@ -2021,11 +2052,9 @@ function WheelBotPage() {
                       <button className="chip" type="button" onClick={() => openUpdatePosition(p, "CLOSED_EARLY")}>Clôturer</button>
                       <button className="chip" type="button" onClick={() => openUpdatePosition(p, "EXPIRED_WORTHLESS")}>Expirée</button>
                       <button className="chip" type="button" onClick={() => openUpdatePosition(p, "ASSIGNED")}>Assignée</button>
-                      <button className="chip" type="button" onClick={() => {
-                        if (window.confirm("Supprimer cette position ouverte ?")) {
-                          deletePositionMutation.mutate(p.id);
-                        }
-                      }}>Supprimer</button>
+                      <button className="chip" type="button" onClick={() => openCancelPosition(p)}>
+                        Annuler la position
+                      </button>
                     </div>
                   ) : null}
                 </div>
@@ -2178,6 +2207,31 @@ function WheelBotPage() {
             <div className="modal-actions">
               <button className="chip" type="button" onClick={() => setPositionUpdateOpen(false)}>Annuler</button>
               <button className="scan-btn" type="button" onClick={submitUpdatePosition}>Valider</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {cancelModalOpen && cancelTarget ? (
+        <div className="modal-overlay" onClick={() => setCancelModalOpen(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-title">Annuler la position</div>
+            <div className="modal-subtitle">{cancelTarget.symbol}</div>
+            <div className="modal-grid">
+              <label>
+                Motif (obligatoire)
+                <select value={cancelReason} onChange={(e) => setCancelReason(e.target.value)}>
+                  <option value="">Sélectionner</option>
+                  <option value="erreur_de_saisie">Erreur de saisie</option>
+                  <option value="trade_non_execute">Trade non exécuté</option>
+                </select>
+              </label>
+            </div>
+            <div className="modal-actions">
+              <button className="chip" type="button" onClick={() => setCancelModalOpen(false)}>Annuler</button>
+              <button className="scan-btn" type="button" disabled={!cancelReason} onClick={submitCancelPosition}>
+                Confirmer
+              </button>
             </div>
           </div>
         </div>

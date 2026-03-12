@@ -2,14 +2,22 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-POSITION_STATUSES = {"OPEN", "CLOSED_EARLY", "EXPIRED_WORTHLESS", "ASSIGNED"}
+POSITION_STATUSES = {"OPEN", "CLOSED_EARLY", "EXPIRED_WORTHLESS", "ASSIGNED", "CANCELLED"}
 POSITION_TYPES = {"SELL PUT", "SELL CALL"}
 ALLOWED_TRANSITIONS = {
-    "OPEN": {"CLOSED_EARLY", "EXPIRED_WORTHLESS", "ASSIGNED"},
+    "OPEN": {"CLOSED_EARLY", "EXPIRED_WORTHLESS", "ASSIGNED", "CANCELLED"},
 }
 
 
 def calc_position_fields(position) -> None:
+    if position.status == "CANCELLED":
+        position.capital_required = 0
+        position.pnl_net = None
+        position.days_to_expiration = None
+        position.expires_soon = False
+        position.trigger_sell_call = False
+        return
+
     capital_required = position.strike * 100 * position.contracts
     position.capital_required = capital_required
 
