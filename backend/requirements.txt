@@ -12,3 +12,4 @@ pandas==3.0.1
 aiosqlite==0.19.0
 apscheduler==3.10.4
 websockets==16.0
+pandas-market-calendars==4.4.1

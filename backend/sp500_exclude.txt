@@ -1,0 +1,16 @@
+# Symbols with persistent Yahoo issues or renamed tickers
+ANSS
+FI
+IPG
+CTLT
+WRK
+WBA
+DFS
+PARA
+HES
+K
+JNPR
+PXD
+DAY
+WTY
+WYC

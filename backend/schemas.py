@@ -1,6 +1,6 @@
 """Pydantic schemas for API requests/responses."""
 
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 from pydantic import BaseModel
 
@@ -15,8 +15,18 @@ class SignalBase(BaseModel):
     delta: Optional[float] = None
     iv: Optional[float] = None
     open_interest: Optional[int] = None
+    volume: Optional[int] = None
+    spread: Optional[float] = None
     apr: Optional[float] = None
+    contract_price: Optional[float] = None
+    max_profit: Optional[float] = None
+    distance_to_strike_pct: Optional[float] = None
+    is_itm: Optional[bool] = None
     status: str
+    contracts: Optional[int] = None
+    budget_used: Optional[float] = None
+    max_budget_per_trade: Optional[float] = None
+    earnings_date: Optional[str] = None
 
 
 class SignalCreate(SignalBase):
@@ -27,6 +37,53 @@ class SignalResponse(SignalBase):
     id: int
     expiration: str
     created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PositionBase(BaseModel):
+    symbol: str
+    position_type: str  # SELL PUT / SELL CALL
+    status: str  # OPEN / CLOSED_EARLY / EXPIRED_WORTHLESS / ASSIGNED
+    strike: float
+    dte_open: int
+    expiration_date: date
+    premium_received: float
+    contracts: int
+    capital_required: float
+    opened_at: datetime
+    closed_at: Optional[datetime] = None
+    close_price: Optional[float] = None
+    expired_at: Optional[datetime] = None
+    assigned_at: Optional[datetime] = None
+    pnl_net: Optional[float] = None
+    days_to_expiration: Optional[int] = None
+    expires_soon: Optional[bool] = None
+    trigger_sell_call: Optional[bool] = None
+
+
+class PositionCreate(BaseModel):
+    symbol: str
+    position_type: str  # SELL PUT / SELL CALL
+    strike: float
+    dte_open: int
+    expiration_date: date
+    premium_received: float
+    contracts: int
+    opened_at: Optional[datetime] = None
+
+
+class PositionUpdate(BaseModel):
+    status: str
+    closed_at: Optional[datetime] = None
+    close_price: Optional[float] = None
+    expired_at: Optional[datetime] = None
+    assigned_at: Optional[datetime] = None
+
+
+class PositionResponse(PositionBase):
+    id: int
 
     class Config:
         from_attributes = True
@@ -44,6 +101,9 @@ class ScanHistoryResponse(BaseModel):
     avg_apr: Optional[float]
     max_apr: Optional[float]
     duration_seconds: Optional[float]
+    symbols_total: Optional[int]
+    symbols_priced: Optional[int]
+    symbols_affordable: Optional[int]
 
     class Config:
         from_attributes = True
@@ -58,6 +118,24 @@ class FilterParams(BaseModel):
     max_dte: Optional[int] = None
     sort_by: Optional[str] = "apr"  # apr, dte, iv, delta
     sort_order: Optional[str] = "desc"  # asc, desc
+
+
+class ScanRequest(BaseModel):
+    capital: Optional[float] = None
+    delta_target: Optional[float] = None
+    min_dte: Optional[int] = None
+    max_dte: Optional[int] = None
+    min_iv: Optional[float] = None
+    min_apr: Optional[float] = None
+
+
+class SymbolHistoryResponse(BaseModel):
+    scan_date: datetime
+    symbol: str
+    price: float
+    strike: float
+    dte: int
+    apr: Optional[float]
 
 
 class StatisticsResponse(BaseModel):
