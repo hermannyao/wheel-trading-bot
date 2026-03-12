@@ -36,6 +36,10 @@ export interface ScanHistory {
   scan_date: string;
   total_symbols: number;
   total_signals: number;
+  scan_id?: string | null;
+  status?: string | null;
+  params_json?: string | null;
+  message?: string | null;
   sell_put_count?: number;
   low_volatility_count?: number;
   expensive_count?: number;
@@ -46,6 +50,20 @@ export interface ScanHistory {
   symbols_total?: number | null;
   symbols_priced?: number | null;
   symbols_affordable?: number | null;
+  symbols_processed?: number | null;
+}
+
+export interface ScanResultsResponse {
+  scan_id: string;
+  status: string;
+  message?: string | null;
+  results: Signal[];
+  statistics?: ScanHistory | null;
+}
+
+export interface ScanRunResponse {
+  scan_id: string;
+  status: string;
 }
 
 export interface StatsResponse {

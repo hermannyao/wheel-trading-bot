@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { apiClient } from "./lib/apiClient";
@@ -7,6 +7,8 @@ import type {
   ScanConfig,
   ScanHistory,
   ScanParams,
+  ScanResultsResponse,
+  ScanRunResponse,
   Signal,
   Position,
   PositionStatus,
@@ -38,6 +40,9 @@ const filterSignals = (signals: Signal[], filter: FilterKey) => {
   if (filter === "under2k") return signals.filter(isUnder2k);
   return signals;
 };
+
+const normalizeStatus = (status?: string | null) =>
+  (status || "idle").toLowerCase();
 
 const aprClass = (apr?: number | null) => {
   if (apr == null) return "low";
@@ -72,6 +77,22 @@ function WheelBotPage() {
   >("results");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [scanError, setScanError] = useState("");
+  const [scanMessage, setScanMessage] = useState("");
+  const [emptyMessage, setEmptyMessage] = useState("");
+  const [activeScanId, setActiveScanId] = useState<string | null>(null);
+  const [scanStatus, setScanStatus] = useState<string>("idle");
+  const [scanStartedAt, setScanStartedAt] = useState<number | null>(null);
+  const [pollingFailures, setPollingFailures] = useState(0);
+  const [pollingPaused, setPollingPaused] = useState(false);
+  const [lastResults, setLastResults] = useState<Signal[]>([]);
+  const [lastStats, setLastStats] = useState<ScanHistory | null>(null);
+  const [progressStats, setProgressStats] = useState<ScanHistory | null>(null);
+  const [filterNotice, setFilterNotice] = useState("");
+  const [lastCompletedParams, setLastCompletedParams] =
+    useState<ScanParams | null>(null);
+  const pollingTimer = useRef<number | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const mobileResultsRef = useRef<HTMLDivElement | null>(null);
   const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768);
   const [desktopTab, setDesktopTab] = useState<"scanner" | "positions">(
     "scanner",
@@ -100,15 +121,23 @@ function WheelBotPage() {
     queryFn: async () => (await apiClient.get("/api/scan-config")).data,
   });
 
-  const resultsQuery = useQuery<Signal[]>({
-    queryKey: ["scan-results"],
-    queryFn: async () =>
-      (
-        await apiClient.get(
-          "/api/scan/results?limit=200&sort_by=apr&sort_order=desc",
-        )
-      ).data,
-  });
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data } = await apiClient.get<ScanResultsResponse>(
+          "/api/scan/results?latest=1&limit=200&sort_by=apr&sort_order=desc",
+        );
+        if (data?.results?.length) {
+          setLastResults(data.results);
+        }
+        if (data?.statistics) {
+          setLastStats(data.statistics);
+        }
+      } catch {
+        // ignore initial load errors
+      }
+    })();
+  }, []);
 
   const historyQuery = useQuery<ScanHistory[]>({
     queryKey: ["scan-history"],
@@ -129,18 +158,62 @@ function WheelBotPage() {
 
   const scanMutation = useMutation({
     mutationFn: async (params: ScanParams) => {
-      await apiClient.post("/api/scan/run", params);
+      const { data } = await apiClient.post<ScanRunResponse>(
+        "/api/scan/run",
+        params,
+      );
+      return data;
     },
-    onSuccess: async () => {
+    onSuccess: async (data) => {
       setScanError("");
+      setScanMessage("");
+      setActiveScanId(data.scan_id);
+      setScanStatus(normalizeStatus(data.status));
+      setScanStartedAt(Date.now());
+      setPollingFailures(0);
+      setPollingPaused(false);
+      setProgressStats(null);
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["scan-results"] }),
         queryClient.invalidateQueries({ queryKey: ["scan-history"] }),
       ]);
     },
     onError: (err) => {
-      console.error(err);
-      setScanError("Le scan a échoué. Vérifie le backend.");
+      setScanStatus("idle");
+      setScanStartedAt(null);
+      setPollingPaused(false);
+      setPollingFailures(0);
+      const apiErr = err as any;
+      const status = apiErr?.response?.status;
+      if (status === 422) {
+        setScanError(
+          apiErr?.response?.data?.detail ||
+            "Paramètres invalides — vérifie les champs en rouge.",
+        );
+      } else {
+        setScanError("Erreur serveur — réessayez dans quelques instants.");
+      }
+    },
+  });
+
+  const cancelScanMutation = useMutation({
+    mutationFn: async (scanId: string) => {
+      const { data } = await apiClient.delete(
+        `/api/scan/cancel?scan_id=${encodeURIComponent(scanId)}`,
+      );
+      return data as { scan_id: string; status: string };
+    },
+    onSuccess: async (data) => {
+      setScanStatus("cancelled");
+      setScanMessage("Scan annulé");
+      setPollingPaused(true);
+      setTimeout(() => setScanMessage(""), 3000);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["scan-history"] }),
+      ]);
+    },
+    onError: () => {
+      setScanMessage("L'annulation a échoué — le scan continue.");
+      setPollingPaused(false);
     },
   });
 
@@ -181,12 +254,19 @@ function WheelBotPage() {
     },
   });
 
-  const { register, handleSubmit, watch, reset, setValue } =
+  const {
+    register,
+    handleSubmit,
+    watch,
+    setValue,
+    formState: { errors, isValid },
+  } =
     useForm<ScanParams>({
+      mode: "onChange",
       defaultValues: {
         capital: 3000,
         delta_target: 0.25,
-        min_dte: 30,
+        min_dte: 21,
         max_dte: 45,
         min_iv: 0.2,
         min_apr: 8,
@@ -225,12 +305,185 @@ function WheelBotPage() {
 
   const capitalValue = watch("capital") ?? 0;
   const deltaValue = watch("delta_target") ?? 0;
+  const minDteValue = watch("min_dte") ?? 0;
+  const maxDteValue = watch("max_dte") ?? 0;
+  const minIvValue = watch("min_iv") ?? 0;
+  const minAprValue = watch("min_apr") ?? 0;
 
-  const signals = resultsQuery.data || [];
+  const signals = lastResults;
   const filteredSignals = useMemo(
     () => filterSignals(signals, filter),
     [signals, filter],
   );
+
+  const scanStatusLabel = useMemo(() => {
+    if (!scanStatus || scanStatus === "idle") return "Inactif";
+    if (scanStatus === "running") return "En cours";
+    if (scanStatus === "completed") return "Terminé";
+    if (scanStatus === "error") return "Échec";
+    if (scanStatus === "cancelled") return "Annulé";
+    return scanStatus;
+  }, [scanStatus]);
+
+  const scanStatusClass = useMemo(() => {
+    if (scanStatus === "running") return "running";
+    if (scanStatus === "completed") return "completed";
+    if (scanStatus === "error") return "failed";
+    if (scanStatus === "cancelled") return "cancelled";
+    return "idle";
+  }, [scanStatus]);
+
+  const progressData = progressStats;
+  const progressTotal =
+    progressData?.symbols_affordable ??
+    progressData?.symbols_priced ??
+    progressData?.symbols_total ??
+    0;
+  const progressDone = progressData?.symbols_processed ?? 0;
+  const progressPct =
+    progressTotal > 0 ? Math.min(100, Math.round((progressDone / progressTotal) * 100)) : 0;
+
+  const isScanning = scanStatus === "running";
+  const paramsChanged = useMemo(() => {
+    if (!lastCompletedParams) return false;
+    return (
+      lastCompletedParams.capital !== capitalValue ||
+      lastCompletedParams.delta_target !== deltaValue ||
+      lastCompletedParams.min_dte !== minDteValue ||
+      lastCompletedParams.max_dte !== maxDteValue ||
+      lastCompletedParams.min_iv !== minIvValue ||
+      lastCompletedParams.min_apr !== minAprValue
+    );
+  }, [
+    lastCompletedParams,
+    capitalValue,
+    deltaValue,
+    minDteValue,
+    maxDteValue,
+    minIvValue,
+    minAprValue,
+  ]);
+
+  const onRetryPolling = () => {
+    setPollingPaused(false);
+    setPollingFailures(0);
+    setScanError("");
+    setScanMessage("");
+  };
+
+  const onCancelScan = () => {
+    if (!activeScanId) return;
+    cancelScanMutation.mutate(activeScanId);
+  };
+
+  useEffect(() => {
+    if (!activeScanId || scanStatus !== "running" || pollingPaused) {
+      if (pollingTimer.current) {
+        window.clearInterval(pollingTimer.current);
+        pollingTimer.current = null;
+      }
+      return;
+    }
+
+    const poll = async () => {
+      try {
+        const { data } = await apiClient.get<ScanResultsResponse>(
+          `/api/scan/results?scan_id=${encodeURIComponent(activeScanId)}&limit=200&sort_by=apr&sort_order=desc`,
+        );
+        const status = normalizeStatus(data?.status);
+        setScanStatus(status);
+        setProgressStats(data?.statistics || null);
+        setScanError("");
+        setPollingFailures(0);
+
+        if (status === "running") {
+          const startedAt = scanStartedAt ?? Date.now();
+          if (Date.now() - startedAt > 90_000) {
+            setPollingPaused(true);
+            setScanStatus("idle");
+            setScanMessage(
+              "Le scan prend plus de temps que prévu. Vérifiez la connexion au serveur.",
+            );
+            return;
+          }
+          return;
+        }
+
+        if (status === "completed") {
+          setLastResults(data?.results || []);
+          if (data?.statistics) {
+            setLastStats(data.statistics);
+          }
+          if ((data?.results || []).length === 0) {
+            setEmptyMessage(
+              data?.message ||
+                "Aucun signal trouvé — essayez d'élargir vos critères",
+            );
+          } else {
+            setEmptyMessage("");
+          }
+          setLastCompletedParams({
+            capital: capitalValue,
+            delta_target: deltaValue,
+            min_dte: minDteValue,
+            max_dte: maxDteValue,
+            min_iv: minIvValue,
+            min_apr: minAprValue,
+          });
+          await queryClient.invalidateQueries({ queryKey: ["scan-history"] });
+          setProgressStats(null);
+          setScanMessage("");
+          contentRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+          mobileResultsRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+        } else if (status === "cancelled") {
+          setScanMessage("Scan annulé");
+          setTimeout(() => setScanMessage(""), 3000);
+        } else if (status === "error") {
+          setScanError(data?.message || "Erreur serveur — réessayez.");
+        } else if (status === "idle") {
+          setScanError("Session de scan perdue — relancez le scan.");
+        }
+      } catch (err: any) {
+        const status = err?.response?.status;
+        if (status === 404) {
+          setScanStatus("idle");
+          setPollingPaused(true);
+          setScanError("Session de scan perdue — relancez le scan.");
+          return;
+        }
+        const failures = pollingFailures + 1;
+        setPollingFailures(failures);
+        if (failures >= 3) {
+          setPollingPaused(true);
+          setScanError(
+            "Impossible de joindre le serveur. Vérifiez que le backend Python est démarré.",
+          );
+        }
+      }
+    };
+
+    poll();
+    pollingTimer.current = window.setInterval(poll, 2000);
+    return () => {
+      if (pollingTimer.current) {
+        window.clearInterval(pollingTimer.current);
+        pollingTimer.current = null;
+      }
+    };
+  }, [
+    activeScanId,
+    scanStatus,
+    pollingPaused,
+    pollingFailures,
+    scanStartedAt,
+    capitalValue,
+    deltaValue,
+    minDteValue,
+    maxDteValue,
+    minIvValue,
+    minAprValue,
+    queryClient,
+  ]);
 
   const topSymbols = useMemo(() => {
     const picks = [...signals]
@@ -268,6 +521,24 @@ function WheelBotPage() {
     if (!list.length) return 0;
     return Math.max(...list);
   }, [filteredSignals]);
+
+  const displayAvgApr = lastStats?.avg_apr ?? avgApr;
+  const displayMaxApr = lastStats?.max_apr ?? maxApr;
+  const displayTotalSignals = lastStats?.total_signals ?? signals.length;
+  const displayScanned = lastStats?.symbols_total ?? 0;
+  const displayPriced = lastStats?.symbols_priced ?? 0;
+
+  useEffect(() => {
+    if (filter !== "all" && filteredSignals.length === 0 && signals.length > 0) {
+      setFilter("all");
+      setFilterNotice(
+        "Le filtre actif ne correspond à aucun résultat — affichage de tous les signaux.",
+      );
+      const timer = window.setTimeout(() => setFilterNotice(""), 3000);
+      return () => window.clearTimeout(timer);
+    }
+    return undefined;
+  }, [filter, filteredSignals.length, signals.length]);
 
   const adjustContracts = (
     symbol: string,
@@ -427,7 +698,7 @@ function WheelBotPage() {
       ) : null}
 
       {/* Desktop Layout */}
-      {!isMobile && scanError ? (
+      {!isMobile && scanError && !isScanning ? (
         <div className="scan-error desktop-only">{scanError}</div>
       ) : null}
 
@@ -439,7 +710,15 @@ function WheelBotPage() {
             <div className="stats-strip-desktop">
               <div className="stat-card">
                 <div className="stat-label">Signaux</div>
-                <div className="stat-value">{signals.length}</div>
+                <div className="stat-value">{displayTotalSignals}</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-label">Scannés</div>
+                <div className="stat-value">{displayScanned}</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-label">Prix dispo</div>
+                <div className="stat-value">{displayPriced}</div>
               </div>
               <div className="stat-card">
                 <div className="stat-label">Filtres</div>
@@ -447,11 +726,11 @@ function WheelBotPage() {
               </div>
               <div className="stat-card">
                 <div className="stat-label">APR moy</div>
-                <div className="stat-value yellow">{formatPct(avgApr, 1)}</div>
+                <div className="stat-value yellow">{formatPct(displayAvgApr, 1)}</div>
               </div>
               <div className="stat-card">
                 <div className="stat-label">APR max</div>
-                <div className="stat-value green">{formatPct(maxApr, 1)}</div>
+                <div className="stat-value green">{formatPct(displayMaxApr, 1)}</div>
               </div>
             </div>
           </div>
@@ -459,17 +738,81 @@ function WheelBotPage() {
           <div className="divider" />
 
           <form className="param-group" onSubmit={onRunScan}>
-            <div className="section-title">Parametres du scan</div>
+            <div className="section-title-row">
+              <div className="section-title">Parametres du scan</div>
+              <div className={`scan-status ${scanStatusClass}`}>
+                {scanStatusLabel}
+              </div>
+            </div>
+            {isScanning ? (
+              <div className="scan-progress">
+                <div className="scan-actions">
+                  <button
+                    className="scan-btn secondary"
+                    type="button"
+                    onClick={onCancelScan}
+                    disabled={cancelScanMutation.isPending}
+                  >
+                    {cancelScanMutation.isPending
+                      ? "Annulation en cours..."
+                      : "Annuler"}
+                  </button>
+                </div>
+                <div className="scan-progress-row">
+                  <span>Scan en cours...</span>
+                  <span>
+                    {progressDone}/{progressTotal} symboles
+                  </span>
+                </div>
+                <div className="scan-progress-bar">
+                  <div
+                    className="scan-progress-fill"
+                    style={{ width: `${progressPct}%` }}
+                  ></div>
+                </div>
+                <div className="scan-progress-row subtle">
+                  <span>Statistiques</span>
+                  <span>
+                    {progressStats?.total_signals ?? 0} signaux · APR max{" "}
+                    {formatPct(progressStats?.max_apr ?? 0, 1)}
+                  </span>
+                </div>
+                {scanMessage ? (
+                  <div className="scan-inline-info">{scanMessage}</div>
+                ) : null}
+                {pollingPaused && scanError ? (
+                  <div className="scan-inline-error">
+                    {scanError}
+                    <button
+                      className="retry-btn"
+                      type="button"
+                      onClick={onRetryPolling}
+                    >
+                      Réessayer
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
             <div className="param-row">
               <div className="param-label">Capital</div>
               <div className="input-wrap">
                 <span className="input-prefix">$</span>
                 <input
                   type="number"
-                  min="0"
-                  {...register("capital", { valueAsNumber: true })}
+                  min="100"
+                  disabled={isScanning}
+                  {...register("capital", {
+                    valueAsNumber: true,
+                    min: { value: 100, message: "Minimum 100$" },
+                    validate: (v) =>
+                      Number.isInteger(v) || "Doit être un entier",
+                  })}
                 />
               </div>
+              {errors.capital ? (
+                <div className="field-error">{errors.capital.message}</div>
+              ) : null}
             </div>
             <div className="param-row">
               <div className="param-label">Delta cible</div>
@@ -479,6 +822,7 @@ function WheelBotPage() {
                   min="0.05"
                   max="0.5"
                   step="0.01"
+                  disabled={isScanning}
                   {...register("delta_target", { valueAsNumber: true })}
                 />
                 <div className="range-val">{Number(deltaValue).toFixed(2)}</div>
@@ -490,15 +834,35 @@ function WheelBotPage() {
                 <input
                   type="number"
                   min="1"
-                  {...register("min_dte", { valueAsNumber: true })}
+                  disabled={isScanning}
+                  {...register("min_dte", {
+                    valueAsNumber: true,
+                    min: { value: 1, message: "Min 1" },
+                    validate: (v) =>
+                      v < maxDteValue || "Doit être < DTE max",
+                  })}
                 />
                 <div className="dte-sep">→</div>
                 <input
                   type="number"
                   min="1"
-                  {...register("max_dte", { valueAsNumber: true })}
+                  max="90"
+                  disabled={isScanning}
+                  {...register("max_dte", {
+                    valueAsNumber: true,
+                    min: { value: 2, message: "Min 2" },
+                    max: { value: 90, message: "Max 90" },
+                    validate: (v) =>
+                      v > minDteValue || "Doit être > DTE min",
+                  })}
                 />
               </div>
+              {errors.min_dte ? (
+                <div className="field-error">{errors.min_dte.message}</div>
+              ) : null}
+              {errors.max_dte ? (
+                <div className="field-error">{errors.max_dte.message}</div>
+              ) : null}
             </div>
             <div className="param-row">
               <div className="param-label">IV minimum</div>
@@ -506,11 +870,18 @@ function WheelBotPage() {
                 <input
                   type="number"
                   step="0.01"
-                  min="0"
-                  {...register("min_iv", { valueAsNumber: true })}
+                  min="0.01"
+                  disabled={isScanning}
+                  {...register("min_iv", {
+                    valueAsNumber: true,
+                    min: { value: 0.01, message: "Min 0.01" },
+                  })}
                 />
                 <span className="input-suffix">IV</span>
               </div>
+              {errors.min_iv ? (
+                <div className="field-error">{errors.min_iv.message}</div>
+              ) : null}
             </div>
             <div className="param-row">
               <div className="param-label">APR minimum</div>
@@ -519,18 +890,35 @@ function WheelBotPage() {
                   type="number"
                   step="0.1"
                   min="0"
-                  {...register("min_apr", { valueAsNumber: true })}
+                  disabled={isScanning}
+                  {...register("min_apr", {
+                    valueAsNumber: true,
+                    min: { value: 1, message: "Min 1%" },
+                    validate: (v) =>
+                      Number.isInteger(v) || "Doit être un entier",
+                  })}
                 />
                 <span className="input-suffix">%</span>
               </div>
+              {errors.min_apr ? (
+                <div className="field-error">{errors.min_apr.message}</div>
+              ) : null}
             </div>
-            <button
-              className="scan-btn"
-              type="submit"
-              disabled={scanMutation.isPending}
-            >
-              {scanMutation.isPending ? "SCAN..." : "⟳  LANCER LE SCAN"}
-            </button>
+            {!isScanning ? (
+              <button
+                className="scan-btn"
+                type="submit"
+                disabled={!isValid || scanMutation.isPending}
+              >
+                {scanMutation.isPending ? "SCAN..." : "⟳  LANCER LE SCAN"}
+              </button>
+            ) : null}
+            {!isScanning && scanMessage ? (
+              <div className="scan-inline-info">{scanMessage}</div>
+            ) : null}
+            {!isScanning && scanError ? (
+              <div className="scan-inline-error">{scanError}</div>
+            ) : null}
           </form>
 
           <div className="divider" />
@@ -610,9 +998,17 @@ function WheelBotPage() {
           </div>
         </aside>
 
-        <main className="content">
+        <main className="content" ref={contentRef}>
           {desktopTab === "scanner" ? (
           <>
+          {paramsChanged ? (
+            <div className="param-banner">
+              Paramètres modifiés — relancez le scan pour mettre à jour les résultats.
+            </div>
+          ) : null}
+          {filterNotice ? (
+            <div className="filter-banner">{filterNotice}</div>
+          ) : null}
           <div className="filter-bar">
             <span className="filter-label">Filtres :</span>
             <button
@@ -675,7 +1071,23 @@ function WheelBotPage() {
                 </tr>
               </thead>
               <tbody>
-                {filteredSignals.map((s) => {
+                {filteredSignals.length === 0 ? (
+                  <tr>
+                    <td colSpan={13}>
+                      <div className="empty-state">
+                        {emptyMessage ||
+                          "Aucun signal trouvé — essayez d'élargir vos critères"}
+                        {lastStats ? (
+                          <div className="empty-sub">
+                            {displayScanned} symboles scannés ·{" "}
+                            {displayPriced} prix disponibles
+                          </div>
+                        ) : null}
+                      </div>
+                    </td>
+                  </tr>
+                ) : (
+                filteredSignals.map((s) => {
                   const contracts =
                     contractsBySymbol[s.symbol] ?? s.contracts ?? 0;
                   const budget = budgetUsed(s);
@@ -799,7 +1211,7 @@ function WheelBotPage() {
                       </td>
                     </tr>
                   );
-                })}
+                }))}
               </tbody>
             </table>
           </div>
@@ -807,30 +1219,36 @@ function WheelBotPage() {
           <div className="bottom-grid">
             <div className="info-card">
               <div className="section-title">Historique des scans</div>
-              {(historyQuery.data || []).map((h) => (
-                <div className="history-item" key={h.id}>
-                  <span className="history-time">
-                    {new Date(h.scan_date).toLocaleString("fr-FR", {
-                      day: "2-digit",
-                      month: "2-digit",
-                      year: "numeric",
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}
-                  </span>
-                  <div className="history-badges">
-                    <span className="hbadge green">
-                      {h.total_signals} signaux
-                    </span>
-                    <span className="hbadge blue">
-                      {h.symbols_affordable ?? 0} abordables
-                    </span>
-                    <span className="hbadge gray">
-                      {h.symbols_priced ?? 0} prix dispo
-                    </span>
-                  </div>
+              {(historyQuery.data || []).length === 0 ? (
+                <div className="empty-state">
+                  Aucun scan dans l'historique — lancez votre premier scan.
                 </div>
-              ))}
+              ) : (
+                (historyQuery.data || []).map((h) => (
+                  <div className="history-item" key={h.id}>
+                    <span className="history-time">
+                      {new Date(h.scan_date).toLocaleString("fr-FR", {
+                        day: "2-digit",
+                        month: "2-digit",
+                        year: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </span>
+                    <div className="history-badges">
+                      <span className="hbadge green">
+                        {h.total_signals} signaux
+                      </span>
+                      <span className="hbadge blue">
+                        {h.symbols_affordable ?? 0} abordables
+                      </span>
+                      <span className="hbadge gray">
+                        {h.symbols_priced ?? 0} prix dispo
+                      </span>
+                    </div>
+                  </div>
+                ))
+              )}
             </div>
             <div className="info-card">
               <div className="section-title">Glossaire</div>
@@ -983,7 +1401,7 @@ function WheelBotPage() {
           </div>
         </header>
 
-        {scanError ? (
+        {scanError && !isScanning ? (
           <div className="scan-error mobile-only">{scanError}</div>
         ) : null}
 
@@ -991,11 +1409,28 @@ function WheelBotPage() {
           <div
             className={`mobile-page ${mobilePage === "results" ? "active" : ""}`}
             id="page-results"
+            ref={mobileResultsRef}
           >
+            {paramsChanged ? (
+              <div className="param-banner">
+                Paramètres modifiés — relancez le scan pour mettre à jour les résultats.
+              </div>
+            ) : null}
+            {filterNotice ? (
+              <div className="filter-banner">{filterNotice}</div>
+            ) : null}
             <div className="stats-strip">
               <div className="stat-card">
                 <div className="stat-label">Signaux</div>
-                <div className="stat-value">{signals.length}</div>
+                <div className="stat-value">{displayTotalSignals}</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-label">Scannés</div>
+                <div className="stat-value">{displayScanned}</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-label">Prix dispo</div>
+                <div className="stat-value">{displayPriced}</div>
               </div>
               <div className="stat-card">
                 <div className="stat-label">Filtrés</div>
@@ -1003,11 +1438,11 @@ function WheelBotPage() {
               </div>
               <div className="stat-card">
                 <div className="stat-label">APR moy</div>
-                <div className="stat-value yellow">{formatPct(avgApr, 1)}</div>
+                <div className="stat-value yellow">{formatPct(displayAvgApr, 1)}</div>
               </div>
               <div className="stat-card">
                 <div className="stat-label">APR max</div>
-                <div className="stat-value green">{formatPct(maxApr, 1)}</div>
+                <div className="stat-value green">{formatPct(displayMaxApr, 1)}</div>
               </div>
             </div>
             <div className="filter-scroll">
@@ -1043,7 +1478,18 @@ function WheelBotPage() {
               </div>
             </div>
             <div className="signal-list">
-              {filteredSignals.map((s) => {
+              {filteredSignals.length === 0 ? (
+                <div className="empty-state">
+                  {emptyMessage ||
+                    "Aucun signal trouvé — essayez d'élargir vos critères"}
+                  {lastStats ? (
+                    <div className="empty-sub">
+                      {displayScanned} symboles scannés · {displayPriced} prix disponibles
+                    </div>
+                  ) : null}
+                </div>
+              ) : (
+              filteredSignals.map((s) => {
                 const contracts =
                   contractsBySymbol[s.symbol] ?? s.contracts ?? 0;
                 const pct = budgetPct(s);
@@ -1172,7 +1618,7 @@ function WheelBotPage() {
                     </div>
                   </div>
                 );
-              })}
+              }))}
             </div>
           </div>
 
@@ -1181,17 +1627,81 @@ function WheelBotPage() {
             id="page-params"
           >
             <div className="params-section">
-              <div className="section-title">Paramètres du scan</div>
+              <div className="section-title-row">
+                <div className="section-title">Paramètres du scan</div>
+                <div className={`scan-status ${scanStatusClass}`}>
+                  {scanStatusLabel}
+                </div>
+              </div>
+              {isScanning ? (
+                <div className="scan-progress">
+                  <div className="scan-actions">
+                    <button
+                      className="scan-btn secondary"
+                      type="button"
+                      onClick={onCancelScan}
+                      disabled={cancelScanMutation.isPending}
+                    >
+                      {cancelScanMutation.isPending
+                        ? "Annulation en cours..."
+                        : "Annuler"}
+                    </button>
+                  </div>
+                  <div className="scan-progress-row">
+                    <span>Scan en cours...</span>
+                    <span>
+                      {progressDone}/{progressTotal} symboles
+                    </span>
+                  </div>
+                  <div className="scan-progress-bar">
+                    <div
+                      className="scan-progress-fill"
+                      style={{ width: `${progressPct}%` }}
+                    ></div>
+                  </div>
+                  <div className="scan-progress-row subtle">
+                    <span>Statistiques</span>
+                    <span>
+                      {progressStats?.total_signals ?? 0} signaux · APR max{" "}
+                      {formatPct(progressStats?.max_apr ?? 0, 1)}
+                    </span>
+                  </div>
+                  {scanMessage ? (
+                    <div className="scan-inline-info">{scanMessage}</div>
+                  ) : null}
+                  {pollingPaused && scanError ? (
+                    <div className="scan-inline-error">
+                      {scanError}
+                      <button
+                        className="retry-btn"
+                        type="button"
+                        onClick={onRetryPolling}
+                      >
+                        Réessayer
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
               <div className="param-row">
                 <div className="param-label">Capital</div>
                 <div className="input-wrap">
                   <span className="input-prefix">$</span>
                   <input
                     type="number"
-                    min="0"
-                    {...register("capital", { valueAsNumber: true })}
+                    min="100"
+                    disabled={isScanning}
+                    {...register("capital", {
+                      valueAsNumber: true,
+                      min: { value: 100, message: "Minimum 100$" },
+                      validate: (v) =>
+                        Number.isInteger(v) || "Doit être un entier",
+                    })}
                   />
                 </div>
+                {errors.capital ? (
+                  <div className="field-error">{errors.capital.message}</div>
+                ) : null}
               </div>
               <div className="param-row">
                 <div className="param-label">Delta cible</div>
@@ -1201,6 +1711,7 @@ function WheelBotPage() {
                     min="0.05"
                     max="0.5"
                     step="0.01"
+                    disabled={isScanning}
                     {...register("delta_target", { valueAsNumber: true })}
                   />
                   <div className="range-val">
@@ -1214,27 +1725,54 @@ function WheelBotPage() {
                   <input
                     type="number"
                     min="1"
-                    {...register("min_dte", { valueAsNumber: true })}
+                    disabled={isScanning}
+                    {...register("min_dte", {
+                      valueAsNumber: true,
+                      min: { value: 1, message: "Min 1" },
+                      validate: (v) =>
+                        v < maxDteValue || "Doit être < DTE max",
+                    })}
                   />
                   <div className="dte-sep">→</div>
                   <input
                     type="number"
                     min="1"
-                    {...register("max_dte", { valueAsNumber: true })}
+                    max="90"
+                    disabled={isScanning}
+                    {...register("max_dte", {
+                      valueAsNumber: true,
+                      min: { value: 2, message: "Min 2" },
+                      max: { value: 90, message: "Max 90" },
+                      validate: (v) =>
+                        v > minDteValue || "Doit être > DTE min",
+                    })}
                   />
                 </div>
+                {errors.min_dte ? (
+                  <div className="field-error">{errors.min_dte.message}</div>
+                ) : null}
+                {errors.max_dte ? (
+                  <div className="field-error">{errors.max_dte.message}</div>
+                ) : null}
               </div>
               <div className="param-row">
                 <div className="param-label">IV minimum</div>
                 <div className="input-wrap">
-                  <input
-                    type="number"
-                    step="0.01"
-                    min="0"
-                    {...register("min_iv", { valueAsNumber: true })}
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0.01"
+                  disabled={isScanning}
+                    {...register("min_iv", {
+                      valueAsNumber: true,
+                      min: { value: 0.01, message: "Min 0.01" },
+                    })}
                   />
                   <span className="input-suffix">IV</span>
                 </div>
+                {errors.min_iv ? (
+                  <div className="field-error">{errors.min_iv.message}</div>
+                ) : null}
               </div>
               <div className="param-row">
                 <div className="param-label">APR minimum</div>
@@ -1243,19 +1781,36 @@ function WheelBotPage() {
                     type="number"
                     step="0.1"
                     min="0"
-                    {...register("min_apr", { valueAsNumber: true })}
+                    disabled={isScanning}
+                  {...register("min_apr", {
+                    valueAsNumber: true,
+                    min: { value: 1, message: "Min 1%" },
+                    validate: (v) =>
+                      Number.isInteger(v) || "Doit être un entier",
+                  })}
                   />
                   <span className="input-suffix">%</span>
                 </div>
+                {errors.min_apr ? (
+                  <div className="field-error">{errors.min_apr.message}</div>
+                ) : null}
               </div>
-              <button
-                className="scan-btn"
-                type="button"
-                disabled={scanMutation.isPending}
-                onClick={onRunScan}
-              >
-                {scanMutation.isPending ? "SCAN..." : "⟳  LANCER LE SCAN"}
-              </button>
+              {!isScanning ? (
+                <button
+                  className="scan-btn"
+                  type="button"
+                  disabled={!isValid || scanMutation.isPending}
+                  onClick={onRunScan}
+                >
+                  {scanMutation.isPending ? "SCAN..." : "⟳  LANCER LE SCAN"}
+                </button>
+              ) : null}
+              {!isScanning && scanMessage ? (
+                <div className="scan-inline-info">{scanMessage}</div>
+              ) : null}
+              {!isScanning && scanError ? (
+                <div className="scan-inline-error">{scanError}</div>
+              ) : null}
             </div>
             <div className="params-section">
               <div className="section-title">Critères actifs</div>
@@ -1329,40 +1884,46 @@ function WheelBotPage() {
             className={`mobile-page ${mobilePage === "history" ? "active" : ""}`}
             id="page-history"
           >
-            {(historyQuery.data || []).map((h) => (
-              <div className="history-card" key={h.id}>
-                <div className="history-header">
-                  <div className="history-date">
-                    {new Date(h.scan_date).toLocaleString("fr-FR", {
-                      day: "2-digit",
-                      month: "2-digit",
-                      year: "numeric",
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}
+            {(historyQuery.data || []).length === 0 ? (
+              <div className="empty-state">
+                Aucun scan dans l'historique — lancez votre premier scan.
+              </div>
+            ) : (
+              (historyQuery.data || []).map((h) => (
+                <div className="history-card" key={h.id}>
+                  <div className="history-header">
+                    <div className="history-date">
+                      {new Date(h.scan_date).toLocaleString("fr-FR", {
+                        day: "2-digit",
+                        month: "2-digit",
+                        year: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </div>
+                  </div>
+                  <div className="history-badges">
+                    <span className="hbadge green">
+                      {h.total_signals} signaux
+                    </span>
+                    <span className="hbadge blue">
+                      {h.symbols_affordable ?? 0} abordables
+                    </span>
+                    <span className="hbadge gray">
+                      {h.symbols_priced ?? 0} prix dispo
+                    </span>
+                  </div>
+                  <div className="history-bar">
+                    <div
+                      className="history-fill"
+                      style={{
+                        width: `${h.symbols_total ? Math.min(100, ((h.symbols_affordable ?? 0) / h.symbols_total) * 100) : 0}%`,
+                      }}
+                    />
                   </div>
                 </div>
-                <div className="history-badges">
-                  <span className="hbadge green">
-                    {h.total_signals} signaux
-                  </span>
-                  <span className="hbadge blue">
-                    {h.symbols_affordable ?? 0} abordables
-                  </span>
-                  <span className="hbadge gray">
-                    {h.symbols_priced ?? 0} prix dispo
-                  </span>
-                </div>
-                <div className="history-bar">
-                  <div
-                    className="history-fill"
-                    style={{
-                      width: `${h.symbols_total ? Math.min(100, ((h.symbols_affordable ?? 0) / h.symbols_total) * 100) : 0}%`,
-                    }}
-                  />
-                </div>
-              </div>
-            ))}
+              ))
+            )}
             <div className="params-section">
               <div className="section-title">Glossaire</div>
               <div className="glossary-list">

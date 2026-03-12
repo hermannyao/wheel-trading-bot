@@ -221,6 +221,9 @@ def _pick_candidate_put(
         premium = bid if bid > 0 else ask
         if premium <= 0:
             continue
+        # Enforce strict OTM target: strike must be <= target strike
+        if strike > target_strike:
+            continue
         iv = row.get("impliedVolatility")
         delta = _put_delta(price, strike, dte, iv, RISK_FREE_RATE)
         if delta is None:
@@ -297,6 +300,14 @@ def scan_symbol(symbol: str, price: float, overrides: dict) -> Dict[str, Any] | 
         open_interest = put.get("openInterest")
         spread = abs(ask - bid) if ask and bid else None
         spread_pct = (spread / bid) if spread is not None and bid > 0 else None
+        # Hard filters for IV, OI, Spread
+        if iv is None or iv < min_iv:
+            return None
+        if open_interest is None or int(open_interest) < min_open_interest:
+            return None
+        if spread_pct is None or spread_pct > max_spread_pct:
+            return None
+
         apr = _calc_apr(premium, strike, dte) if bid > 0 and ask > 0 else None
         if apr is None or apr < min_apr:
             return None
@@ -350,7 +361,12 @@ def scan_symbol(symbol: str, price: float, overrides: dict) -> Dict[str, Any] | 
         return None
 
 
-def scan_all(capital: float | None = None, overrides: dict | None = None) -> Dict[str, Any]:
+def scan_all(
+    capital: float | None = None,
+    overrides: dict | None = None,
+    cancel_event: Any | None = None,
+    progress_cb: Any | None = None,
+) -> Dict[str, Any]:
     """Scan S&P 500, filter by budget, scan options in parallel."""
     overrides = overrides or {}
     budget = capital if capital is not None else MAX_BUDGET_PER_TRADE
@@ -366,14 +382,23 @@ def scan_all(capital: float | None = None, overrides: dict | None = None) -> Dic
     ]
 
     results: List[Dict[str, Any]] = []
+    processed = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(scan_symbol, sym, prices[sym], overrides): sym for sym in affordable
-        }
+        futures = {}
+        for sym in affordable:
+            if cancel_event and cancel_event.is_set():
+                break
+            futures[executor.submit(scan_symbol, sym, prices[sym], overrides)] = sym
+
         for future in as_completed(futures):
+            if cancel_event and cancel_event.is_set():
+                break
             res = future.result()
             if res:
                 results.append(res)
+            processed += 1
+            if progress_cb:
+                progress_cb(processed, len(affordable))
 
     results.sort(key=lambda x: x.get("apr") or 0, reverse=True)
     return {
@@ -381,6 +406,7 @@ def scan_all(capital: float | None = None, overrides: dict | None = None) -> Dic
         "symbols_total": len(symbols),
         "symbols_priced": len(prices),
         "symbols_affordable": len(affordable),
+        "symbols_processed": processed,
     }
 
 

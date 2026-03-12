@@ -19,6 +19,8 @@ import yfinance as yf
 import pandas_market_calendars as mcal
 
 from database import Signal, ScanHistory, SignalHistory, Alert, Position, get_db, init_db
+from application.position_service import PositionService
+from infrastructure.scan_runner import ScanRunner
 from config import (
     SP500_SOURCE_URL,
     SP500_LOCAL_FILE,
@@ -47,6 +49,8 @@ from schemas import (
     PositionCreate,
     PositionUpdate,
     PositionResponse,
+    ScanRunResponse,
+    ScanResultsResponse,
 )
 from logging_config import setup_logging
 
@@ -100,49 +104,13 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
+scan_runner = ScanRunner()
 
 # In-memory cache for symbol metadata
 _SYMBOL_INFO_CACHE: dict[str, dict] = {}
 _SYMBOL_INFO_TS: dict[str, float] = {}
 _SYMBOL_INFO_TTL_SECONDS = 60 * 60 * 12
 
-# Position rules
-POSITION_STATUSES = {"OPEN", "CLOSED_EARLY", "EXPIRED_WORTHLESS", "ASSIGNED"}
-POSITION_TYPES = {"SELL PUT", "SELL CALL"}
-ALLOWED_TRANSITIONS = {
-    "OPEN": {"CLOSED_EARLY", "EXPIRED_WORTHLESS", "ASSIGNED"},
-}
-
-
-def _calc_position_fields(position: Position) -> None:
-    capital_required = position.strike * 100 * position.contracts
-    position.capital_required = capital_required
-
-    today = datetime.now(timezone.utc).date()
-    if position.expiration_date:
-        position.days_to_expiration = (position.expiration_date - today).days
-    else:
-        position.days_to_expiration = None
-
-    position.expires_soon = (
-        position.status == "OPEN"
-        and position.days_to_expiration is not None
-        and position.days_to_expiration <= 5
-    )
-
-    position.trigger_sell_call = position.status == "ASSIGNED"
-
-    if position.status == "CLOSED_EARLY":
-        position.pnl_net = (
-            (position.premium_received * 100 * position.contracts)
-            - (position.close_price or 0) * 100 * position.contracts
-        )
-    elif position.status == "EXPIRED_WORTHLESS":
-        position.pnl_net = position.premium_received * 100 * position.contracts
-    elif position.status == "ASSIGNED":
-        position.pnl_net = position.premium_received * 100 * position.contracts
-    else:
-        position.pnl_net = None
 
 
 # ============================================================================
@@ -205,7 +173,40 @@ async def get_signals(
     return signals
 
 
-@app.get("/api/scan/results", response_model=List[SignalResponse])
+def _build_signal_query(
+    db: Session,
+    status: Optional[str],
+    symbol: Optional[str],
+    min_apr: Optional[float],
+    max_apr: Optional[float],
+    min_iv: Optional[float],
+    min_dte: Optional[int],
+    max_dte: Optional[int],
+    scan_id: Optional[str] = None,
+):
+    query = db.query(Signal)
+    if scan_id:
+        query = query.filter(Signal.scan_id == scan_id)
+
+    if status:
+        query = query.filter(Signal.status == status)
+    if symbol:
+        query = query.filter(Signal.symbol.ilike(f"%{symbol}%"))
+    if min_apr is not None:
+        query = query.filter(Signal.apr >= min_apr)
+    if max_apr is not None:
+        query = query.filter(Signal.apr <= max_apr)
+    if min_iv is not None:
+        query = query.filter(Signal.iv >= min_iv)
+    if min_dte is not None:
+        query = query.filter(Signal.dte >= min_dte)
+    if max_dte is not None:
+        query = query.filter(Signal.dte <= max_dte)
+
+    return query
+
+
+@app.get("/api/scan/results", response_model=ScanResultsResponse | List[SignalResponse])
 async def get_scan_results(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
@@ -218,8 +219,61 @@ async def get_scan_results(
     max_dte: Optional[int] = None,
     sort_by: str = Query("apr"),
     sort_order: str = Query("desc"),
+    scan_id: Optional[str] = None,
+    latest: bool = Query(False),
     db: Session = Depends(get_db),
 ):
+    if scan_id or latest:
+        history = None
+        resolved_scan_id = scan_id
+        if not resolved_scan_id:
+            history = db.query(ScanHistory).order_by(desc(ScanHistory.scan_date)).first()
+            if not history:
+                return {
+                    "scan_id": "",
+                    "status": "IDLE",
+                    "message": "Aucun scan lancé",
+                    "results": [],
+                    "statistics": None,
+                }
+            resolved_scan_id = history.scan_id or str(history.id)
+
+        if not history:
+            history = db.query(ScanHistory).filter(ScanHistory.scan_id == resolved_scan_id).first()
+
+        if not history:
+            raise HTTPException(status_code=404, detail="Scan not found")
+
+        query = _build_signal_query(
+            db,
+            status=status,
+            symbol=symbol,
+            min_apr=min_apr,
+            max_apr=max_apr,
+            min_iv=min_iv,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            scan_id=history.scan_id,
+        )
+
+        if sort_by not in {"apr", "dte", "iv", "delta", "price", "strike", "open_interest", "created_at"}:
+            sort_by = "apr"
+
+        sort_column = getattr(Signal, sort_by, Signal.apr)
+        if sort_order.lower() == "asc":
+            query = query.order_by(sort_column.asc())
+        else:
+            query = query.order_by(sort_column.desc())
+
+        results = query.offset(offset).limit(limit).all()
+        return {
+            "scan_id": history.scan_id or resolved_scan_id,
+            "status": history.status or "UNKNOWN",
+            "message": history.message,
+            "results": results,
+            "statistics": history,
+        }
+
     return await get_signals(
         limit=limit,
         offset=offset,
@@ -285,9 +339,11 @@ async def get_scan_history_alias(limit: int = Query(10, ge=1, le=100), db: Sessi
     return await get_scan_history(limit=limit, db=db)
 
 
-@app.post("/api/scan/run")
-async def run_scan_alias(scan_request: ScanRequest | None = None, db: Session = Depends(get_db)):
-    return await trigger_scan(scan_request=scan_request, db=db)
+@app.post("/api/scan/run", response_model=ScanRunResponse, status_code=202)
+async def run_scan_alias(scan_request: ScanRequest | None = None):
+    overrides = (scan_request.model_dump(exclude_none=True) if scan_request else {})
+    scan_id = scan_runner.start(overrides)
+    return {"scan_id": scan_id, "status": "RUNNING"}
 
 
 @app.get("/api/market/status")
@@ -342,84 +398,26 @@ async def get_market_status():
 
 @app.get("/api/positions", response_model=List[PositionResponse])
 async def list_positions(db: Session = Depends(get_db)):
-    positions = db.query(Position).order_by(desc(Position.opened_at)).all()
-    for position in positions:
-        _calc_position_fields(position)
-    db.commit()
-    return positions
+    service = PositionService(db)
+    return service.list_positions()
 
 
 @app.post("/api/positions", response_model=PositionResponse)
 async def create_position(payload: PositionCreate, db: Session = Depends(get_db)):
-    if payload.position_type not in POSITION_TYPES:
-        raise HTTPException(status_code=422, detail="Invalid position_type")
-    opened_at = payload.opened_at or datetime.now(timezone.utc)
-    position = Position(
-        symbol=payload.symbol,
-        position_type=payload.position_type,
-        status="OPEN",
-        strike=payload.strike,
-        dte_open=payload.dte_open,
-        expiration_date=payload.expiration_date,
-        premium_received=payload.premium_received,
-        contracts=payload.contracts,
-        capital_required=0,
-        opened_at=opened_at,
-    )
-    _calc_position_fields(position)
-    db.add(position)
-    db.commit()
-    db.refresh(position)
-    return position
+    service = PositionService(db)
+    return service.create_position(payload)
 
 
 @app.patch("/api/positions/{position_id}", response_model=PositionResponse)
 async def update_position(position_id: int, payload: PositionUpdate, db: Session = Depends(get_db)):
-    position = db.query(Position).filter(Position.id == position_id).first()
-    if not position:
-        raise HTTPException(status_code=404, detail="Position not found")
-
-    if payload.status not in POSITION_STATUSES:
-        raise HTTPException(status_code=422, detail="Invalid status")
-
-    if position.status == payload.status:
-        return position
-
-    allowed = ALLOWED_TRANSITIONS.get(position.status, set())
-    if payload.status not in allowed:
-        raise HTTPException(status_code=409, detail="Invalid status transition")
-
-    if payload.status == "CLOSED_EARLY":
-        if not payload.closed_at or payload.close_price is None:
-            raise HTTPException(status_code=422, detail="closed_at and close_price required")
-        position.closed_at = payload.closed_at
-        position.close_price = payload.close_price
-    elif payload.status == "EXPIRED_WORTHLESS":
-        if not payload.expired_at:
-            raise HTTPException(status_code=422, detail="expired_at required")
-        position.expired_at = payload.expired_at
-    elif payload.status == "ASSIGNED":
-        if not payload.assigned_at:
-            raise HTTPException(status_code=422, detail="assigned_at required")
-        position.assigned_at = payload.assigned_at
-
-    position.status = payload.status
-    _calc_position_fields(position)
-    db.commit()
-    db.refresh(position)
-    return position
+    service = PositionService(db)
+    return service.update_position(position_id, payload)
 
 
 @app.delete("/api/positions/{position_id}")
 async def delete_position(position_id: int, db: Session = Depends(get_db)):
-    position = db.query(Position).filter(Position.id == position_id).first()
-    if not position:
-        raise HTTPException(status_code=404, detail="Position not found")
-    if position.status != "OPEN":
-        raise HTTPException(status_code=409, detail="Only OPEN positions can be deleted")
-    db.delete(position)
-    db.commit()
-    return {"status": "deleted"}
+    service = PositionService(db)
+    return service.delete_position(position_id)
 
 
 @app.get("/api/positions/export")
@@ -568,105 +566,20 @@ async def get_symbols_info(symbols: str = Query("", max_length=2000)):
     return result
 
 
-@app.post("/api/scan")
-async def trigger_scan(scan_request: ScanRequest | None = None, db: Session = Depends(get_db)):
-    """Trigger a new scan (will run async)."""
-    # Import scanning logic
-    try:
-        from main_scan import run_scan
-        overrides = (scan_request.model_dump(exclude_none=True) if scan_request else {})
+@app.post("/api/scan", response_model=ScanRunResponse, status_code=202)
+async def trigger_scan(scan_request: ScanRequest | None = None):
+    """Trigger a new scan (async)."""
+    overrides = (scan_request.model_dump(exclude_none=True) if scan_request else {})
+    scan_id = scan_runner.start(overrides)
+    return {"scan_id": scan_id, "status": "RUNNING"}
 
-        # Run scan and get results
-        scan_result = await asyncio.to_thread(run_scan, overrides)
-        signals = scan_result.get("signals", [])
-        
-        # Clear old signals and insert new ones
-        db.query(Signal).delete()
-        
-        for sig in signals:
-            db_signal = Signal(
-                symbol=sig.get("symbol"),
-                price=sig.get("price"),
-                strike=sig.get("strike"),
-                dte=sig.get("dte"),
-                bid=sig.get("bid"),
-                ask=sig.get("ask"),
-                delta=sig.get("delta"),
-                iv=sig.get("iv"),
-                open_interest=sig.get("openInterest"),
-                volume=sig.get("volume"),
-                spread=sig.get("spread"),
-                apr=sig.get("apr"),
-                contract_price=sig.get("contract_price"),
-                max_profit=sig.get("max_profit"),
-                distance_to_strike_pct=sig.get("distance_to_strike_pct"),
-                is_itm=1 if sig.get("is_itm") else 0,
-                status=sig.get("status"),
-                expiration=sig.get("expiration"),
-                contracts=sig.get("contracts"),
-                budget_used=sig.get("budget_used"),
-                max_budget_per_trade=sig.get("max_budget_per_trade"),
-                earnings_date=sig.get("earnings_date"),
-            )
-            db.add(db_signal)
-        
-        db.commit()
 
-        # Create scan history record
-        sell_put_count = sum(1 for s in signals if s.get("status") == "SELL PUT")
-        avg_apr = sum(s.get("apr", 0) for s in signals if s.get("apr")) / len(signals) if signals else 0
-        max_apr = max((s.get("apr", 0) for s in signals if s.get("apr")), default=0)
-
-        history = ScanHistory(
-            total_symbols=len(signals),
-            total_signals=len(signals),
-            sell_put_count=sell_put_count,
-            avg_apr=avg_apr,
-            max_apr=max_apr,
-            symbols_total=scan_result.get("symbols_total"),
-            symbols_priced=scan_result.get("symbols_priced"),
-            symbols_affordable=scan_result.get("symbols_affordable"),
-        )
-        db.add(history)
-        db.commit()
-
-        if history.id:
-            snapshots = []
-            for s in signals:
-                snapshots.append(
-                    SignalHistory(
-                        scan_id=history.id,
-                        scan_date=history.scan_date,
-                        symbol=s.get("symbol"),
-                        price=s.get("price"),
-                        strike=s.get("strike"),
-                        dte=s.get("dte"),
-                        apr=s.get("apr"),
-                    )
-                )
-            if snapshots:
-                db.add_all(snapshots)
-                db.commit()
-
-        # Broadcast update
-        await manager.broadcast({
-            "type": "scan_complete",
-            "total_signals": len(signals),
-            "sell_put_count": sell_put_count,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
-
-        return {
-            "status": "success",
-            "total_signals": len(signals),
-            "sell_put_count": sell_put_count,
-            "symbols_total": scan_result.get("symbols_total"),
-            "symbols_priced": scan_result.get("symbols_priced"),
-            "symbols_affordable": scan_result.get("symbols_affordable"),
-        }
-    except Exception as e:
-        logger.error(f"Scan error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@app.delete("/api/scan/cancel")
+async def cancel_scan(scan_id: str = Query(..., min_length=1)):
+    """Cancel an in-flight scan."""
+    if scan_runner.cancel(scan_id):
+        return {"scan_id": scan_id, "status": "CANCEL_REQUESTED"}
+    raise HTTPException(status_code=404, detail="Scan not found")
 
 
 @app.get("/api/alerts", response_model=List[AlertResponse])

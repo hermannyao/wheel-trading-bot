@@ -6,7 +6,7 @@ from scanner import scan_all, export_to_csv
 from config import MAX_BUDGET_PER_TRADE
 
 
-def run_scan(overrides: dict | None = None):
+def run_scan(overrides: dict | None = None, cancel_event=None, progress_cb=None):
     """Execute scan and return results."""
     start_time = datetime.now()
 
@@ -15,7 +15,12 @@ def run_scan(overrides: dict | None = None):
         capital = None
         if overrides and isinstance(overrides, dict):
             capital = overrides.get("capital")
-        result = scan_all(capital=capital or MAX_BUDGET_PER_TRADE, overrides=overrides or {})
+        result = scan_all(
+            capital=capital or MAX_BUDGET_PER_TRADE,
+            overrides=overrides or {},
+            cancel_event=cancel_event,
+            progress_cb=progress_cb,
+        )
         signals = result.get("signals", [])
 
         duration = (datetime.now() - start_time).total_seconds()

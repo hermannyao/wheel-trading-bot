@@ -27,6 +27,7 @@ class SignalBase(BaseModel):
     budget_used: Optional[float] = None
     max_budget_per_trade: Optional[float] = None
     earnings_date: Optional[str] = None
+    scan_id: Optional[str] = None
 
 
 class SignalCreate(SignalBase):
@@ -94,6 +95,10 @@ class ScanHistoryResponse(BaseModel):
     scan_date: datetime
     total_symbols: int
     total_signals: int
+    scan_id: Optional[str] = None
+    status: Optional[str] = None
+    params_json: Optional[str] = None
+    message: Optional[str] = None
     sell_put_count: int
     low_volatility_count: int
     expensive_count: int
@@ -104,6 +109,7 @@ class ScanHistoryResponse(BaseModel):
     symbols_total: Optional[int]
     symbols_priced: Optional[int]
     symbols_affordable: Optional[int]
+    symbols_processed: Optional[int]
 
     class Config:
         from_attributes = True
@@ -127,6 +133,19 @@ class ScanRequest(BaseModel):
     max_dte: Optional[int] = None
     min_iv: Optional[float] = None
     min_apr: Optional[float] = None
+
+
+class ScanRunResponse(BaseModel):
+    scan_id: str
+    status: str
+
+
+class ScanResultsResponse(BaseModel):
+    scan_id: str
+    status: str
+    message: Optional[str] = None
+    results: list[SignalResponse]
+    statistics: Optional[ScanHistoryResponse] = None
 
 
 class SymbolHistoryResponse(BaseModel):

@@ -54,6 +54,7 @@ class Signal(Base):
     budget_used = Column(Float, nullable=True)
     max_budget_per_trade = Column(Float, nullable=True)
     earnings_date = Column(String, nullable=True)
+    scan_id = Column(String, nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -73,9 +74,14 @@ class ScanHistory(Base):
     avg_apr = Column(Float, nullable=True)
     max_apr = Column(Float, nullable=True)
     duration_seconds = Column(Float, nullable=True)
+    scan_id = Column(String, nullable=True, index=True)
+    status = Column(String, nullable=True)
+    params_json = Column(String, nullable=True)
+    message = Column(String, nullable=True)
     symbols_total = Column(Integer, nullable=True)
     symbols_priced = Column(Integer, nullable=True)
     symbols_affordable = Column(Integer, nullable=True)
+    symbols_processed = Column(Integer, nullable=True)
 
 
 class SignalHistory(Base):
