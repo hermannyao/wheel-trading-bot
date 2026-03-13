@@ -64,6 +64,7 @@ class PositionBase(BaseModel):
     trigger_sell_call: Optional[bool] = None
     motif_annulation: Optional[str] = None
     snooze_until: Optional[date] = None
+    ignore_calls: Optional[bool] = None
 
 
 class PositionCreate(BaseModel):
@@ -85,6 +86,7 @@ class PositionUpdate(BaseModel):
     assigned_at: Optional[datetime] = None
     motif_annulation: Optional[str] = None
     snooze_until: Optional[date] = None
+    ignore_calls: Optional[bool] = None
 
 
 class PositionLegBase(BaseModel):

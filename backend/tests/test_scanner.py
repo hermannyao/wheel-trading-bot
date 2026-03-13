@@ -83,8 +83,13 @@ def test_scan_symbol_success(monkeypatch):
     dummy = DummyTicker([exp], puts_df)
 
     monkeypatch.setattr(scanner.yf, 'Ticker', lambda symbol: dummy)
+    monkeypatch.setattr(scanner, '_put_delta', lambda *_: -0.25)
 
-    res = scanner.scan_symbol('TEST', price=100.0, overrides={'min_dte': 21, 'max_dte': 45, 'min_apr': 1})
+    res = scanner.scan_symbol(
+        'TEST',
+        price=100.0,
+        overrides={'min_dte': 21, 'max_dte': 45, 'min_apr': 1, 'capital': 10000, 'max_spread_pct': 0.3},
+    )
     assert res is not None
     assert res['symbol'] == 'TEST'
     assert res['strike'] == 95.0

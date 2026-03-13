@@ -1,5 +1,6 @@
 import importlib
 from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 from fastapi.testclient import TestClient
 
@@ -7,7 +8,11 @@ import database
 
 
 def make_test_client():
-    engine = create_engine('sqlite:///:memory:', connect_args={'check_same_thread': False})
+    engine = create_engine(
+        'sqlite://',
+        connect_args={'check_same_thread': False},
+        poolclass=StaticPool,
+    )
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
     database.engine = engine
@@ -63,9 +68,44 @@ def test_trigger_scan_inserts_signals(monkeypatch):
             'symbols_affordable': 1,
         }
 
-    monkeypatch.setattr('main_scan.run_scan', fake_run_scan)
+    import main
 
-    res = client.post('/api/scan', json={
+    def fake_start(_params):
+        db = database.SessionLocal()
+        try:
+            sig = fake_run_scan({})['signals'][0]
+            db.add(database.Signal(
+                symbol=sig['symbol'],
+                price=sig['price'],
+                strike=sig['strike'],
+                dte=sig['dte'],
+                bid=sig['bid'],
+                ask=sig['ask'],
+                delta=sig['delta'],
+                iv=sig['iv'],
+                open_interest=sig['openInterest'],
+                volume=sig['volume'],
+                spread=sig['spread'],
+                apr=sig['apr'],
+                contract_price=sig['contract_price'],
+                max_profit=sig['max_profit'],
+                distance_to_strike_pct=sig['distance_to_strike_pct'],
+                is_itm=0,
+                status=sig['status'],
+                expiration=sig['expiration'],
+                contracts=sig['contracts'],
+                budget_used=sig['budget_used'],
+                max_budget_per_trade=sig['max_budget_per_trade'],
+                scan_id='test-scan',
+            ))
+            db.commit()
+        finally:
+            db.close()
+        return 'test-scan'
+
+    monkeypatch.setattr(main.scan_runner, 'start', fake_start)
+
+    res = client.post('/api/scan/run', json={
         'capital': 10000,
         'delta_target': 0.25,
         'min_dte': 30,
@@ -73,7 +113,7 @@ def test_trigger_scan_inserts_signals(monkeypatch):
         'min_iv': 0.2,
         'min_apr': 8,
     })
-    assert res.status_code == 200
+    assert res.status_code == 202
 
     res_signals = client.get('/api/signals?limit=10')
     assert res_signals.status_code == 200

@@ -1,6 +1,7 @@
 import importlib
 from datetime import datetime, date
 from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 from fastapi.testclient import TestClient
 
@@ -8,7 +9,11 @@ import database
 
 
 def make_client():
-    engine = create_engine('sqlite:///:memory:', connect_args={'check_same_thread': False})
+    engine = create_engine(
+        'sqlite://',
+        connect_args={'check_same_thread': False},
+        poolclass=StaticPool,
+    )
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
     database.engine = engine
@@ -93,9 +98,14 @@ def test_cost_basis_multi_call(monkeypatch):
         f"/api/positions/{pos['id']}",
         json={'status': 'ASSIGNED', 'assigned_at': datetime.utcnow().isoformat()},
     )
-    client.post(
+    res_leg = client.post(
         f"/api/positions/{pos['id']}/legs",
         json={'leg_type': 'SELL CALL', 'strike': 10.5, 'premium_received': 0.2},
+    )
+    call_id = res_leg.json()['id']
+    client.patch(
+        f"/api/positions/{pos['id']}/calls/{call_id}/close",
+        json={'scenario': 'expired', 'close_date': date.today().isoformat()},
     )
     client.post(
         f"/api/positions/{pos['id']}/legs",

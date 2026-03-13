@@ -29,6 +29,8 @@ from config import (
     MIN_APR,
     DELTA_MIN,
     DELTA_MAX,
+    CALL_DELTA_MIN,
+    CALL_DELTA_MAX,
     MAX_SPREAD_PCT,
     MAX_WORKERS,
     RISK_FREE_RATE,
@@ -193,6 +195,17 @@ def _put_delta(price: float, strike: float, dte: int, iv: float, r: float) -> fl
     return _norm_cdf(d1) - 1.0
 
 
+def _call_delta(price: float, strike: float, dte: int, iv: float, r: float) -> float | None:
+    if price <= 0 or strike <= 0 or dte <= 0 or iv is None or iv <= 0:
+        return None
+    t = dte / 365.0
+    try:
+        d1 = (math.log(price / strike) + (r + 0.5 * iv * iv) * t) / (iv * math.sqrt(t))
+    except (ValueError, ZeroDivisionError):
+        return None
+    return _norm_cdf(d1)
+
+
 def _calc_apr(premium: float, strike: float, dte: int) -> float | None:
     if premium <= 0 or strike <= 0 or dte <= 0:
         return None
@@ -269,6 +282,7 @@ def scan_covered_calls(
     symbol: str,
     price: float,
     cost_basis: float,
+    put_strike: float | None,
     contracts: int,
     overrides: dict,
 ) -> list[dict]:
@@ -279,6 +293,8 @@ def scan_covered_calls(
         min_apr = overrides.get("min_apr", MIN_APR)
         min_open_interest = overrides.get("min_open_interest", MIN_OPEN_INTEREST)
         max_spread_pct = overrides.get("max_spread_pct", MAX_SPREAD_PCT)
+        call_delta_min = overrides.get("call_delta_min", CALL_DELTA_MIN)
+        call_delta_max = overrides.get("call_delta_max", CALL_DELTA_MAX)
 
         ticker = yf.Ticker(symbol)
         expiration, dte = _select_expiration(ticker.options, min_dte, max_dte)
@@ -290,8 +306,9 @@ def scan_covered_calls(
             return []
         calls_df = calls_df.copy()
         calls_df["otm_pct"] = (calls_df["strike"] - price) / price
+        min_strike = max(cost_basis, put_strike or cost_basis)
         calls_df = calls_df[
-            (calls_df["strike"] >= cost_basis)
+            (calls_df["strike"] >= min_strike)
             & (calls_df["otm_pct"] >= 0.03)
             & (calls_df["otm_pct"] <= 0.08)
         ].copy()
@@ -318,6 +335,12 @@ def scan_covered_calls(
             if spread_pct is None or spread_pct > max_spread_pct:
                 continue
 
+            delta = _call_delta(price, strike, dte, float(iv), RISK_FREE_RATE) if iv is not None else None
+            if delta is None:
+                continue
+            if not (call_delta_min <= delta <= call_delta_max):
+                continue
+
             apr = _calc_apr(premium, strike, dte) if bid > 0 and ask > 0 else None
             if apr is None or apr < min_apr:
                 continue
@@ -327,6 +350,7 @@ def scan_covered_calls(
             otm_pct = ((strike - price) / price) * 100 if price else 0
             contract_price = round(premium * 100, 2) if bid > 0 and ask > 0 else None
             max_profit = round(contract_price * contracts, 2) if contract_price is not None else None
+            gain_max_call = round(premium * 100 * contracts, 2)
 
             results.append({
                 "symbol": symbol,
@@ -335,6 +359,7 @@ def scan_covered_calls(
                 "dte": dte,
                 "bid": bid if bid > 0 else None,
                 "ask": ask if ask > 0 else None,
+                "delta": round(delta, 4),
                 "iv": round(float(iv), 4) if iv is not None else None,
                 "openInterest": int(open_interest) if open_interest is not None else None,
                 "volume": int(volume) if volume is not None else None,
@@ -342,6 +367,7 @@ def scan_covered_calls(
                 "apr": apr,
                 "contract_price": contract_price,
                 "max_profit": max_profit,
+                "gain_max_call": gain_max_call,
                 "distance_to_basis": round(distance_to_basis, 2),
                 "distance_to_basis_pct": round(distance_to_basis_pct, 2),
                 "otm_pct": round(otm_pct, 2),

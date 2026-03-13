@@ -164,6 +164,28 @@ class PositionService:
         self.db.refresh(position)
         return position
 
+    def set_ignore_calls(self, position_id: int, ignored: bool):
+        position = self.db.query(Position).filter(Position.id == position_id).first()
+        if not position:
+            raise HTTPException(status_code=404, detail="Position not found")
+        if position.status != "ASSIGNED":
+            raise HTTPException(status_code=409, detail="Only ASSIGNED positions can be updated")
+        open_call = (
+            self.db.query(PositionLeg)
+            .filter(
+                PositionLeg.position_id == position_id,
+                PositionLeg.leg_type == "SELL CALL",
+                PositionLeg.status == "OPEN",
+            )
+            .first()
+        )
+        if open_call:
+            raise HTTPException(status_code=409, detail="Call leg already open")
+        position.ignore_calls = ignored
+        self.db.commit()
+        self.db.refresh(position)
+        return position
+
     def _load_position_and_leg(self, position_id: int, call_id: int):
         position = self.db.query(Position).filter(Position.id == position_id).first()
         if not position:

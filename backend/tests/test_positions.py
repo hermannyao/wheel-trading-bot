@@ -1,6 +1,7 @@
 import importlib
 from datetime import datetime, date
 from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 from fastapi.testclient import TestClient
 
@@ -8,7 +9,11 @@ import database
 
 
 def make_client():
-    engine = create_engine('sqlite:///:memory:', connect_args={'check_same_thread': False})
+    engine = create_engine(
+        'sqlite://',
+        connect_args={'check_same_thread': False},
+        poolclass=StaticPool,
+    )
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
     database.engine = engine

@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 from typing import Generator
 
-from sqlalchemy import Column, Integer, Float, String, DateTime, Date, Boolean, ForeignKey, create_engine
+from sqlalchemy import Column, Integer, Float, String, DateTime, Date, Boolean, ForeignKey, create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 Base = declarative_base()
@@ -125,6 +125,7 @@ class Position(Base):
     trigger_sell_call = Column(Boolean, default=False)
     motif_annulation = Column(String, nullable=True)
     snooze_until = Column(Date, nullable=True)
+    ignore_calls = Column(Boolean, default=False)
 
 
 class PositionLeg(Base):
@@ -169,3 +170,13 @@ def get_db() -> Generator[Session, None, None]:
 def init_db() -> None:
     """Initialize database tables."""
     Base.metadata.create_all(bind=engine)
+    _ensure_column("positions", "ignore_calls", "BOOLEAN DEFAULT 0")
+
+
+def _ensure_column(table: str, column: str, ddl: str) -> None:
+    inspector = inspect(engine)
+    columns = {col["name"] for col in inspector.get_columns(table)}
+    if column in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))

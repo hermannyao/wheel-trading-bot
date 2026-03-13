@@ -2,6 +2,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { apiClient } from "./lib/apiClient";
+import ClosedCyclesList from "./components/ClosedCyclesList";
+import CloseCallModal from "./components/CloseCallModal";
+import CallConfirmModal from "./components/CallConfirmModal";
 import type {
   MarketStatusResponse,
   ScanConfig,
@@ -13,6 +16,8 @@ import type {
   Position,
   PositionStatus,
   AssignedCallSuggestion,
+  CallCloseImpact,
+  ClosedCycle,
 } from "./types";
 
 const FILTERS = ["all", "safe", "high", "under2k"] as const;
@@ -34,6 +39,14 @@ const formatPct = (value: number, digits = 1) =>
 const isSafe = (s: Signal) => (s.delta ?? 0) < 0.15;
 const isHighYield = (s: Signal) => (s.apr ?? 0) > 30;
 const isUnder2k = (s: Signal) => (s.strike ?? 0) * 100 <= 2000;
+
+const legStatusLabel = (status?: string | null) => {
+  if (status === "OPEN") return "Ouvert";
+  if (status === "EXPIRED") return "Expiré";
+  if (status === "EXERCISED") return "Exercé";
+  if (status === "BOUGHT_BACK") return "Racheté";
+  return "—";
+};
 
 const filterSignals = (signals: Signal[], filter: FilterKey) => {
   if (filter === "safe") return signals.filter(isSafe);
@@ -67,6 +80,13 @@ const distanceLabel = (s: Signal) => {
   return `${Math.abs(dist).toFixed(1)}% ${label}`;
 };
 
+const dteClass = (dte?: number) => {
+  if (dte == null) return "dte-pill";
+  if (dte < 21) return "dte-pill red";
+  if (dte < 28) return "dte-pill orange";
+  return "dte-pill green";
+};
+
 function WheelBotPage() {
   const queryClient = useQueryClient();
   const [filter, setFilter] = useState<FilterKey>("all");
@@ -74,7 +94,7 @@ function WheelBotPage() {
     Record<string, number>
   >({});
   const [mobilePage, setMobilePage] = useState<
-    "results" | "params" | "history" | "positions"
+    "results" | "params" | "history" | "positions" | "closed"
   >("results");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [scanError, setScanError] = useState("");
@@ -95,7 +115,7 @@ function WheelBotPage() {
   const contentRef = useRef<HTMLDivElement | null>(null);
   const mobileResultsRef = useRef<HTMLDivElement | null>(null);
   const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768);
-  const [desktopTab, setDesktopTab] = useState<"scanner" | "positions">(
+  const [desktopTab, setDesktopTab] = useState<"scanner" | "positions" | "closed">(
     "scanner",
   );
   const [positionModalOpen, setPositionModalOpen] = useState(false);
@@ -104,6 +124,31 @@ function WheelBotPage() {
   const [cancelReason, setCancelReason] = useState("");
   const [cancelTarget, setCancelTarget] = useState<Position | null>(null);
   const [showCancelled, setShowCancelled] = useState(false);
+  const [assignedTabs, setAssignedTabs] = useState<Record<number, string>>(() => {
+    try {
+      const raw = window.localStorage.getItem("assignedTabs");
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
+  const [showBlockedOnly, setShowBlockedOnly] = useState(false);
+  const [callConfirmOpen, setCallConfirmOpen] = useState(false);
+  const [callConfirmDraft, setCallConfirmDraft] = useState({
+    position_id: 0,
+    symbol: "",
+    strike: 0,
+    premium: 0,
+    dte: 0,
+    expiration: "",
+  });
+  const [snoozeDates, setSnoozeDates] = useState<Record<number, string>>({});
+  const [closeCallOpen, setCloseCallOpen] = useState(false);
+  const [closeCallScenario, setCloseCallScenario] = useState<"expired" | "exerced" | "bought_back">("expired");
+  const [closeCallBuyback, setCloseCallBuyback] = useState("");
+  const [closeCallLeg, setCloseCallLeg] = useState<{ position_id: number; call_id: number; symbol: string; strike: number } | null>(null);
+  const [closeCallImpact, setCloseCallImpact] = useState<CallCloseImpact | null>(null);
+  const [closeCallImpactError, setCloseCallImpactError] = useState("");
   const [positionDraft, setPositionDraft] = useState({
     symbol: "",
     position_type: "SELL PUT",
@@ -158,6 +203,11 @@ function WheelBotPage() {
   const assignedCallsQuery = useQuery<AssignedCallSuggestion[]>({
     queryKey: ["assigned-calls"],
     queryFn: async () => (await apiClient.get("/api/positions/assigned-calls")).data,
+  });
+
+  const closedCyclesQuery = useQuery<ClosedCycle[]>({
+    queryKey: ["closed-cycles"],
+    queryFn: async () => (await apiClient.get("/api/positions/closed-cycles")).data,
   });
 
   const marketQuery = useQuery<MarketStatusResponse>({
@@ -256,6 +306,70 @@ function WheelBotPage() {
     },
   });
 
+  const createCallLegMutation = useMutation({
+    mutationFn: async (payload: {
+      position_id: number;
+      strike: number;
+      premium_received: number;
+      dte?: number;
+      expiration_date?: string;
+    }) => {
+      const { position_id, ...rest } = payload;
+      await apiClient.post(`/api/positions/${position_id}/legs`, {
+        leg_type: "SELL CALL",
+        ...rest,
+      });
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["assigned-calls"] });
+      setCallConfirmOpen(false);
+    },
+  });
+
+  const snoozeMutation = useMutation({
+    mutationFn: async (payload: { position_id: number; snooze_until: string }) => {
+      const { position_id, snooze_until } = payload;
+      await apiClient.post(
+        `/api/positions/${position_id}/snooze?snooze_until=${encodeURIComponent(snooze_until)}`,
+      );
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["assigned-calls"] });
+    },
+  });
+
+  const ignoreCallMutation = useMutation({
+    mutationFn: async (payload: { position_id: number; ignored: boolean }) => {
+      const { position_id, ignored } = payload;
+      await apiClient.post(`/api/positions/${position_id}/ignore-call?ignored=${ignored}`);
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["assigned-calls"] });
+    },
+  });
+
+  const closeCallMutation = useMutation({
+    mutationFn: async (payload: {
+      position_id: number;
+      call_id: number;
+      scenario: "expired" | "exerced" | "bought_back";
+      buyback_premium?: number;
+      close_date: string;
+    }) => {
+      const { position_id, call_id, ...rest } = payload;
+      await apiClient.patch(`/api/positions/${position_id}/calls/${call_id}/close`, rest);
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["assigned-calls"] });
+      await queryClient.invalidateQueries({ queryKey: ["closed-cycles"] });
+      setCloseCallOpen(false);
+      setCloseCallBuyback("");
+      setCloseCallLeg(null);
+      setCloseCallImpact(null);
+      setCloseCallImpactError("");
+    },
+  });
+
   const {
     register,
     handleSubmit,
@@ -334,6 +448,49 @@ function WheelBotPage() {
     if (scanStatus === "cancelled") return "cancelled";
     return "idle";
   }, [scanStatus]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("assignedTabs", JSON.stringify(assignedTabs));
+    } catch {
+      // ignore
+    }
+  }, [assignedTabs]);
+
+  useEffect(() => {
+    if (!closeCallOpen || !closeCallLeg) {
+      setCloseCallImpact(null);
+      setCloseCallImpactError("");
+      return;
+    }
+    const scenario = closeCallScenario;
+    const buyback =
+      scenario === "bought_back" ? Number(closeCallBuyback || 0) : undefined;
+    let active = true;
+    setCloseCallImpact(null);
+    setCloseCallImpactError("");
+    apiClient
+      .get(
+        `/api/positions/${closeCallLeg.position_id}/calls/${closeCallLeg.call_id}/impact`,
+        {
+          params: {
+            scenario,
+            buyback_premium: buyback,
+          },
+        },
+      )
+      .then((res) => {
+        if (!active) return;
+        setCloseCallImpact(res.data);
+      })
+      .catch(() => {
+        if (!active) return;
+        setCloseCallImpactError("Impact indisponible.");
+      });
+    return () => {
+      active = false;
+    };
+  }, [closeCallOpen, closeCallLeg, closeCallScenario, closeCallBuyback]);
 
   const progressData = progressStats;
   const progressTotal =
@@ -608,6 +765,103 @@ function WheelBotPage() {
     return positions.filter((p) => p.status !== "CANCELLED");
   }, [positions, showCancelled]);
 
+  const assignedCalls = assignedCallsQuery.data || [];
+
+  const getAssignedTab = (item: AssignedCallSuggestion) => {
+    return (
+      assignedTabs[item.position_id] ||
+      (item.suggested_calls && item.suggested_calls.length > 0
+        ? "sellcall"
+        : "position")
+    );
+  };
+
+  const setAssignedTab = (id: number, tab: string) => {
+    setAssignedTabs((prev) => ({ ...prev, [id]: tab }));
+  };
+
+  const assignedBadge = (item: AssignedCallSuggestion) => {
+    const callLegs = (item.legs || []).filter((l) => l.leg_type === "SELL CALL");
+    const hasOpenCall = callLegs.some((l) => l.status === "OPEN");
+    const openCallLeg = callLegs.find((l) => l.status === "OPEN");
+    const lastCallStrike = openCallLeg?.strike;
+    const lastCallDte = openCallLeg?.expiration_date
+      ? Math.ceil(
+          (new Date(openCallLeg.expiration_date).getTime() - Date.now()) / 86400000,
+        )
+      : undefined;
+    const firstCall = item.suggested_calls?.[0];
+    const watch =
+      (hasOpenCall &&
+        ((lastCallDte != null && lastCallDte < 21) ||
+          (item.spot_price != null &&
+            lastCallStrike != null &&
+            item.spot_price > 0.9 * lastCallStrike))) ||
+      (!!firstCall &&
+        (firstCall.dte < 21 ||
+          (item.spot_price != null &&
+            firstCall.strike != null &&
+            item.spot_price > 0.9 * firstCall.strike)));
+
+    if (item.status === "snoozed") {
+      return { label: "⚪ En attente", className: "badge gray", priority: 3 };
+    }
+    if (item.status === "ignored") {
+      return { label: "⚪ Ignorée", className: "badge gray", priority: 3 };
+    }
+    if (item.status !== "viable") {
+      return { label: "🔴 Bloquée", className: "badge red", priority: 0 };
+    }
+    if (hasOpenCall) {
+      return { label: "🟢 En cours", className: "badge green", priority: 2 };
+    }
+    if (watch) {
+      return { label: "🟡 À surveiller", className: "badge orange", priority: 1 };
+    }
+    return { label: "🟢 En cours", className: "badge green", priority: 2 };
+  };
+
+  const openCallLegFor = (item: AssignedCallSuggestion) => {
+    const callLegs = (item.legs || []).filter((l) => l.leg_type === "SELL CALL");
+    const openLeg = callLegs.find((l) => l.status === "OPEN");
+    if (!openLeg) return null;
+    const dte = openLeg.expiration_date
+      ? Math.ceil(
+          (new Date(openLeg.expiration_date).getTime() - Date.now()) / 86400000,
+        )
+      : null;
+    return { ...openLeg, dte };
+  };
+
+  const assignedSorted = useMemo(() => {
+    const list = [...assignedCalls].sort((a, b) => {
+      const pa = assignedBadge(a).priority;
+      const pb = assignedBadge(b).priority;
+      return pa - pb;
+    });
+    return showBlockedOnly
+      ? list.filter((item) => assignedBadge(item).priority === 0)
+      : list;
+  }, [assignedCalls, showBlockedOnly]);
+
+  const blockedCount = useMemo(
+    () => assignedCalls.filter((item) => assignedBadge(item).priority === 0).length,
+    [assignedCalls],
+  );
+
+  const weightedApr = useMemo(() => {
+    const rows = assignedCalls
+      .filter((item) => item.status === "viable" && item.suggested_calls?.length)
+      .map((item) => {
+        const capital = item.put_strike * 100 * item.contracts;
+        const apr = item.suggested_calls?.[0]?.apr ?? 0;
+        return { capital, apr };
+      });
+    const total = rows.reduce((sum, r) => sum + r.capital, 0);
+    if (!total) return 0;
+    return rows.reduce((sum, r) => sum + r.apr * r.capital, 0) / total;
+  }, [assignedCalls]);
+
   const openCreatePosition = (s: Signal) => {
     const fallbackExp = s.dte
       ? new Date(Date.now() + s.dte * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
@@ -680,6 +934,31 @@ function WheelBotPage() {
     setCancelModalOpen(false);
   };
 
+  const submitCallConfirm = () => {
+    if (!callConfirmDraft.position_id) return;
+    createCallLegMutation.mutate({
+      position_id: callConfirmDraft.position_id,
+      strike: Number(callConfirmDraft.strike),
+      premium_received: Number(callConfirmDraft.premium),
+      dte: callConfirmDraft.dte,
+      expiration_date: callConfirmDraft.expiration || undefined,
+    });
+  };
+
+  const openCloseCallModal = (
+    scenario: "expired" | "exerced" | "bought_back",
+    item: AssignedCallSuggestion,
+    callId: number,
+    strike: number,
+  ) => {
+    setCloseCallScenario(scenario);
+    setCloseCallBuyback("");
+    setCloseCallImpact(null);
+    setCloseCallImpactError("");
+    setCloseCallLeg({ position_id: item.position_id, call_id: callId, symbol: item.symbol, strike });
+    setCloseCallOpen(true);
+  };
+
   const onRunScan = handleSubmit((data) => scanMutation.mutate(data));
 
   const onRunScanClick = () => {
@@ -719,6 +998,13 @@ function WheelBotPage() {
                 onClick={() => setDesktopTab("positions")}
               >
                 Mes positions
+              </button>
+              <button
+                className={`desktop-nav-btn ${desktopTab === "closed" ? "active" : ""}`}
+                type="button"
+                onClick={() => setDesktopTab("closed")}
+              >
+                Cycles clôturés
               </button>
             </div>
           </div>
@@ -1317,7 +1603,7 @@ function WheelBotPage() {
             </div>
           </div>
           </>
-          ) : (
+          ) : desktopTab === "positions" ? (
           <div className="positions-view">
             <div className="table-header-bar">
               <div className="table-title">Mes positions</div>
@@ -1350,76 +1636,379 @@ function WheelBotPage() {
                 <div className="stat-label">P&L réalisé</div>
                 <div className="stat-value yellow">{formatMoney(positionsSummary.realized)}</div>
               </div>
+              <div className="stat-card">
+                <div className="stat-label">APR moyen pondéré</div>
+                <div className="stat-value">{formatPct(weightedApr, 1)}</div>
+              </div>
+              <div
+                className="stat-card clickable"
+                role="button"
+                onClick={() => setShowBlockedOnly((v) => !v)}
+              >
+                <div className="stat-label">Bloquées</div>
+                <div className="stat-value red">{blockedCount}</div>
+              </div>
             </div>
 
             <div className="info-card">
               <div className="section-title">Positions assignées</div>
-              {(assignedCallsQuery.data || []).length === 0 ? (
+              {showBlockedOnly ? (
+                <div className="filter-banner">
+                  Filtre actif : positions bloquées uniquement
+                </div>
+              ) : null}
+              {assignedSorted.length === 0 ? (
                 <div className="empty-state">Aucune position assignée.</div>
               ) : (
-                (assignedCallsQuery.data || []).map((item) => (
-                  <div className="assigned-card" key={item.symbol}>
-                    <div className="assigned-header">
-                      <div className="assigned-title">{item.symbol}</div>
-                      <div className="assigned-sub">
-                        Assignée le {new Date(item.assigned_at).toLocaleDateString("fr-FR")}
+                assignedSorted.map((item) => {
+                  const tab = getAssignedTab(item);
+                  const badge = assignedBadge(item);
+                  const initial = item.put_strike * 100;
+                  const adjusted = item.cost_basis_adjusted * 100;
+                  const reduction = item.reduction_pct;
+                  const capital = item.put_strike * 100 * item.contracts;
+                  return (
+                    <div className="assigned-card" key={item.position_id}>
+                      <div className="assigned-header">
+                        <div>
+                          <div className="assigned-title">{item.symbol}</div>
+                          <div className="assigned-sub">
+                            Assignée le {new Date(item.assigned_at).toLocaleDateString("fr-FR")}
+                          </div>
+                        </div>
+                        <span className={badge.className}>{badge.label}</span>
                       </div>
+                      <div className="tab-bar">
+                        <button
+                          className={`tab-btn ${tab === "position" ? "active" : ""}`}
+                          type="button"
+                          onClick={() => setAssignedTab(item.position_id, "position")}
+                        >
+                          Position
+                        </button>
+                        <button
+                          className={`tab-btn ${tab === "sellcall" ? "active" : ""}`}
+                          type="button"
+                          onClick={() => setAssignedTab(item.position_id, "sellcall")}
+                        >
+                          Sell Call
+                        </button>
+                        <button
+                          className={`tab-btn ${tab === "history" ? "active" : ""}`}
+                          type="button"
+                          onClick={() => setAssignedTab(item.position_id, "history")}
+                        >
+                          Historique
+                        </button>
+                      </div>
+
+                      {tab === "position" ? (
+                        <div>
+                          <div className="assigned-row">
+                            <span>Coût</span>
+                            <span>
+                              {formatMoney(initial)} → {formatMoney(adjusted)} (−{formatPct(reduction, 1)})
+                            </span>
+                          </div>
+                          <div className="assigned-row">
+                            <span>Spot</span>
+                            <span>{item.spot_price ? formatMoney(item.spot_price) : "-"}</span>
+                          </div>
+                          <div className="assigned-row">
+                            <span>Strike Put</span>
+                            <span>{item.put_strike}</span>
+                          </div>
+                          <div className="assigned-row">
+                            <span>Contrats / Actions</span>
+                            <span>
+                              {item.contracts} / {item.shares}
+                            </span>
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {tab === "sellcall" ? (
+                        (() => {
+                          const openLeg = openCallLegFor(item);
+                          if (item.status === "ignored") {
+                            return (
+                              <div className="assigned-empty">
+                                {item.message || "Call ignoré — aucune suggestion affichée."}
+                                <div className="pos-actions" style={{ marginTop: 8 }}>
+                                  <button
+                                    className="chip"
+                                    type="button"
+                                    onClick={() =>
+                                      ignoreCallMutation.mutate({
+                                        position_id: item.position_id,
+                                        ignored: false,
+                                      })
+                                    }
+                                  >
+                                    Réactiver
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          }
+                          if (openLeg) {
+                            const allowExpire = openLeg.dte != null && openLeg.dte <= 1;
+                            return (
+                          <div className="assigned-call">
+                            <div className="assigned-row">
+                              <span>Call ouvert</span>
+                              <span>Strike {openLeg.strike}$</span>
+                            </div>
+                            <div className="assigned-row">
+                              <span>Prime</span>
+                              <span>{openLeg.premium_received}$</span>
+                            </div>
+                            <div className="assigned-row">
+                              <span>DTE restant</span>
+                              <span>{openLeg.dte ?? "-" }j</span>
+                            </div>
+                            <div className="pos-actions" style={{ marginTop: 8 }}>
+                              <button
+                                className="chip"
+                                type="button"
+                                disabled={!allowExpire}
+                                title={!allowExpire ? "Disponible à J-1 avant expiration" : ""}
+                                onClick={() =>
+                                  openCloseCallModal("expired", item, openLeg.id, openLeg.strike)
+                                }
+                              >
+                                Expiré
+                              </button>
+                              <button
+                                className="chip"
+                                type="button"
+                                disabled={!allowExpire}
+                                title={!allowExpire ? "Disponible à J-1 avant expiration" : ""}
+                                onClick={() =>
+                                  openCloseCallModal("exerced", item, openLeg.id, openLeg.strike)
+                                }
+                              >
+                                Exercé
+                              </button>
+                              <button
+                                className="chip"
+                                type="button"
+                                onClick={() =>
+                                  openCloseCallModal("bought_back", item, openLeg.id, openLeg.strike)
+                                }
+                              >
+                                Racheté
+                              </button>
+                            </div>
+                          </div>
+                            );
+                          }
+                          if (item.status === "viable" && item.suggested_calls?.length) {
+                            return (
+                          <>
+                          <table className="assigned-table">
+                            <thead>
+                              <tr>
+                                <th>Strike</th>
+                                <th>Distance spot</th>
+                                <th>Prime</th>
+                                <th>APR</th>
+                                <th>DTE</th>
+                                <th>Gain call</th>
+                                <th></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {item.suggested_calls.map((call, idx) => {
+                                const otmLabel = call.otm_pct != null ? `${call.otm_pct > 0 ? "+" : ""}${call.otm_pct.toFixed(1)}% OTM` : "-";
+                                const gainCall =
+                                  call.gain_max_call ??
+                                  (call.bid != null ? call.bid * 100 * item.contracts : 0);
+                                const gainCycle = call.gain_max_cycle ?? 0;
+                                const gainPct = capital ? (gainCycle / capital) * 100 : 0;
+                                const disabled = !!openLeg;
+                                return (
+                                  <tr key={`${item.position_id}-${idx}`}>
+                                    <td>{call.strike}</td>
+                                    <td>
+                                      <div>{otmLabel}</div>
+                                      <div className="subtle">
+                                        {call.distance_to_basis?.toFixed(2)}$ ·{" "}
+                                        {call.distance_to_basis_pct?.toFixed(1)}% base
+                                      </div>
+                                    </td>
+                                    <td>{call.bid?.toFixed(2)}</td>
+                                    <td>{formatPct(call.apr ?? 0, 1)}</td>
+                                    <td>
+                                      <span
+                                        className={dteClass(call.dte)}
+                                        title={call.expiration || ""}
+                                      >
+                                        {call.dte}j
+                                      </span>
+                                    </td>
+                                    <td>
+                                      {formatMoney(gainCall)}
+                                      <div className="subtle">
+                                        Cycle: {formatMoney(gainCycle)} ·{" "}
+                                        {formatPct(gainPct, 1)}
+                                      </div>
+                                    </td>
+                                    <td>
+                                      <button
+                                        className="chip"
+                                        type="button"
+                                        disabled={disabled}
+                                        title={
+                                          disabled
+                                            ? "Call déjà ouvert — expirez ou rachetez-le d'abord."
+                                            : ""
+                                        }
+                                        onClick={() => {
+                                          setCallConfirmDraft({
+                                            position_id: item.position_id,
+                                            symbol: item.symbol,
+                                            strike: call.strike,
+                                            premium: call.bid || 0,
+                                            dte: call.dte,
+                                            expiration: call.expiration || "",
+                                          });
+                                          setCallConfirmOpen(true);
+                                        }}
+                                      >
+                                        Valider ce Call
+                                      </button>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                          <div className="pos-actions" style={{ marginTop: 8 }}>
+                            <button
+                              className="chip"
+                              type="button"
+                              onClick={() =>
+                                queryClient.invalidateQueries({ queryKey: ["assigned-calls"] })
+                              }
+                            >
+                              Réévaluer maintenant
+                            </button>
+                            <button
+                              className="chip"
+                              type="button"
+                              onClick={() =>
+                                ignoreCallMutation.mutate({
+                                  position_id: item.position_id,
+                                  ignored: true,
+                                })
+                              }
+                            >
+                              Ignorer
+                            </button>
+                          </div>
+                          </>
+                            );
+                          }
+                          return (
+                          <div className="assigned-empty">
+                            {item.message || "Aucun Call viable — conserver la position"}
+                            <div className="pos-actions" style={{ marginTop: 8 }}>
+                              <button
+                                className="chip"
+                                type="button"
+                                onClick={() =>
+                                  queryClient.invalidateQueries({ queryKey: ["assigned-calls"] })
+                                }
+                              >
+                                Réévaluer maintenant
+                              </button>
+                              <button
+                                className="chip"
+                                type="button"
+                                onClick={() =>
+                                  ignoreCallMutation.mutate({
+                                    position_id: item.position_id,
+                                    ignored: true,
+                                  })
+                                }
+                              >
+                                Ignorer
+                              </button>
+                              <input
+                                type="date"
+                                value={snoozeDates[item.position_id] || ""}
+                                onChange={(e) =>
+                                  setSnoozeDates((prev) => ({
+                                    ...prev,
+                                    [item.position_id]: e.target.value,
+                                  }))
+                                }
+                              />
+                              <button
+                                className="chip"
+                                type="button"
+                                onClick={() => {
+                                  const value = snoozeDates[item.position_id];
+                                  if (value) {
+                                    snoozeMutation.mutate({
+                                      position_id: item.position_id,
+                                      snooze_until: value,
+                                    });
+                                  }
+                                }}
+                              >
+                                Snooze jusqu'au…
+                              </button>
+                            </div>
+                          </div>
+                          );
+                        })()
+                      ) : null}
+
+                      {tab === "history" ? (
+                        <div>
+                          {(item.legs || []).length === 0 ? (
+                            <div className="assigned-empty">Aucun leg enregistré.</div>
+                          ) : (
+                            <div>
+                              {(item.legs || []).map((leg, idx) => (
+                                <div className="assigned-row" key={idx}>
+                                  <span>
+                                    {leg.leg_type === "SELL PUT" ? "✅" : "🔄"}{" "}
+                                    {leg.opened_at ? new Date(leg.opened_at).toLocaleDateString("fr-FR") : "--"}
+                                  </span>
+                                  <span>
+                                    {leg.leg_type} · Strike {leg.strike}$ · Prime +{leg.premium_received}$
+                                  </span>
+                                  <span className="subtle">{legStatusLabel(leg.status)}</span>
+                                </div>
+                              ))}
+                              <div className="assigned-row" style={{ marginTop: 6 }}>
+                                <span>P&L cumulé</span>
+                                <span>
+                                  +{item.total_premiums.toFixed(2)}$ / action ·{" "}
+                                  +{formatMoney(item.total_premiums * 100 * item.contracts)} / contrat
+                                </span>
+                              </div>
+                              <div className="pos-actions" style={{ marginTop: 8 }}>
+                                <button
+                                  className="chip"
+                                  type="button"
+                                  onClick={() =>
+                                    (window.location.href = `/api/positions/${item.position_id}/legs/export`)
+                                  }
+                                >
+                                  Exporter ce cycle
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      ) : null}
                     </div>
-                    <div className="assigned-grid">
-                      <div>
-                        <span className="ck">Coût initial</span>
-                        <span className="cv">{formatMoney(item.put_strike * 100)}</span>
-                      </div>
-                      <div>
-                        <span className="ck">Coût ajusté</span>
-                        <span className="cv">{formatMoney(item.cost_basis_adjusted * 100)}</span>
-                      </div>
-                      <div>
-                        <span className="ck">Réduction</span>
-                        <span className="cv">{formatPct(item.reduction_pct, 1)}</span>
-                      </div>
-                      <div>
-                        <span className="ck">Spot</span>
-                        <span className="cv">{item.spot_price ? formatMoney(item.spot_price) : "-"}</span>
-                      </div>
-                    </div>
-                    {item.status === "viable" && item.suggested_call ? (
-                      <div className="assigned-call">
-                        <div className="assigned-row">
-                          <span>Strike</span>
-                          <span>{item.suggested_call.strike}</span>
-                        </div>
-                        <div className="assigned-row">
-                          <span>Distance coût de base</span>
-                          <span>
-                            {item.suggested_call.distance_to_basis?.toFixed(2)}$ ·{" "}
-                            {item.suggested_call.distance_to_basis_pct?.toFixed(1)}%
-                          </span>
-                        </div>
-                        <div className="assigned-row">
-                          <span>Prime (bid)</span>
-                          <span>{item.suggested_call.bid?.toFixed(2)}</span>
-                        </div>
-                        <div className="assigned-row">
-                          <span>APR</span>
-                          <span>{formatPct(item.suggested_call.apr ?? 0, 1)}</span>
-                        </div>
-                        <div className="assigned-row">
-                          <span>DTE</span>
-                          <span>{item.suggested_call.dte}j</span>
-                        </div>
-                        <div className="assigned-row">
-                          <span>Gain max cycle</span>
-                          <span>{formatMoney(item.suggested_call.gain_max_cycle ?? 0)}</span>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="assigned-empty">
-                        {item.message || "Aucun Call viable — conserver la position"}
-                      </div>
-                    )}
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
 
@@ -1474,6 +2063,21 @@ function WheelBotPage() {
                 </tbody>
               </table>
             </div>
+          </div>
+          ) : (
+          <div className="positions-view">
+            <div className="table-header-bar">
+              <div className="table-title">Cycles clôturés</div>
+            </div>
+            <ClosedCyclesList
+              cycles={closedCyclesQuery.data || []}
+              formatMoney={formatMoney}
+              formatPct={formatPct}
+              onNewCycle={(capital) => {
+                setDesktopTab("scanner");
+                setValue("capital", capital);
+              }}
+            />
           </div>
           )}
         </main>
@@ -2107,76 +2711,360 @@ function WheelBotPage() {
                   <div className="stat-value yellow">{formatMoney(positionsSummary.realized)}</div>
                 </div>
               </div>
+              <div className="stats-strip">
+                <div className="stat-card">
+                  <div className="stat-label">APR pondéré</div>
+                  <div className="stat-value">{formatPct(weightedApr, 1)}</div>
+                </div>
+                <div
+                  className="stat-card clickable"
+                  role="button"
+                  onClick={() => setShowBlockedOnly((v) => !v)}
+                >
+                  <div className="stat-label">Bloquées</div>
+                  <div className="stat-value red">{blockedCount}</div>
+                </div>
+              </div>
             </div>
 
             <div className="params-section">
               <div className="section-title">Positions assignées</div>
-              {(assignedCallsQuery.data || []).length === 0 ? (
+              {showBlockedOnly ? (
+                <div className="filter-banner">
+                  Filtre actif : positions bloquées uniquement
+                </div>
+              ) : null}
+              {assignedSorted.length === 0 ? (
                 <div className="empty-state">Aucune position assignée.</div>
               ) : (
-                (assignedCallsQuery.data || []).map((item) => (
-                  <div className="assigned-card" key={item.symbol}>
-                    <div className="assigned-header">
-                      <div className="assigned-title">{item.symbol}</div>
-                      <div className="assigned-sub">
-                        Assignée le {new Date(item.assigned_at).toLocaleDateString("fr-FR")}
+                assignedSorted.map((item) => {
+                  const tab = getAssignedTab(item);
+                  const badge = assignedBadge(item);
+                  const initial = item.put_strike * 100;
+                  const adjusted = item.cost_basis_adjusted * 100;
+                  const reduction = item.reduction_pct;
+                  const capital = item.put_strike * 100 * item.contracts;
+                  return (
+                    <div className="assigned-card" key={item.position_id}>
+                      <div className="assigned-header">
+                        <div>
+                          <div className="assigned-title">{item.symbol}</div>
+                          <div className="assigned-sub">
+                            Assignée le {new Date(item.assigned_at).toLocaleDateString("fr-FR")}
+                          </div>
+                        </div>
+                        <span className={badge.className}>{badge.label}</span>
                       </div>
+                      <div className="tab-bar">
+                        <button
+                          className={`tab-btn ${tab === "position" ? "active" : ""}`}
+                          type="button"
+                          onClick={() => setAssignedTab(item.position_id, "position")}
+                        >
+                          Position
+                        </button>
+                        <button
+                          className={`tab-btn ${tab === "sellcall" ? "active" : ""}`}
+                          type="button"
+                          onClick={() => setAssignedTab(item.position_id, "sellcall")}
+                        >
+                          Sell Call
+                        </button>
+                        <button
+                          className={`tab-btn ${tab === "history" ? "active" : ""}`}
+                          type="button"
+                          onClick={() => setAssignedTab(item.position_id, "history")}
+                        >
+                          Historique
+                        </button>
+                      </div>
+                      {tab === "position" ? (
+                        <div>
+                          <div className="assigned-row">
+                            <span>Coût</span>
+                            <span>
+                              {formatMoney(initial)} → {formatMoney(adjusted)} (−{formatPct(reduction, 1)})
+                            </span>
+                          </div>
+                          <div className="assigned-row">
+                            <span>Spot</span>
+                            <span>{item.spot_price ? formatMoney(item.spot_price) : "-"}</span>
+                          </div>
+                          <div className="assigned-row">
+                            <span>Strike Put</span>
+                            <span>{item.put_strike}</span>
+                          </div>
+                          <div className="assigned-row">
+                            <span>Contrats / Actions</span>
+                            <span>
+                              {item.contracts} / {item.shares}
+                            </span>
+                          </div>
+                        </div>
+                      ) : null}
+                      {tab === "sellcall" ? (
+                        (() => {
+                          const openLeg = openCallLegFor(item);
+                          if (item.status === "ignored") {
+                            return (
+                              <div className="assigned-empty">
+                                {item.message || "Call ignoré — aucune suggestion affichée."}
+                                <div className="pos-actions" style={{ marginTop: 8 }}>
+                                  <button
+                                    className="chip"
+                                    type="button"
+                                    onClick={() =>
+                                      ignoreCallMutation.mutate({
+                                        position_id: item.position_id,
+                                        ignored: false,
+                                      })
+                                    }
+                                  >
+                                    Réactiver
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          }
+                          if (openLeg) {
+                            const allowExpire = openLeg.dte != null && openLeg.dte <= 1;
+                            return (
+                              <div className="assigned-call">
+                                <div className="assigned-row">
+                                  <span>Call ouvert</span>
+                                  <span>Strike {openLeg.strike}$</span>
+                                </div>
+                                <div className="assigned-row">
+                                  <span>Prime</span>
+                                  <span>{openLeg.premium_received}$</span>
+                                </div>
+                                <div className="assigned-row">
+                                  <span>DTE restant</span>
+                                  <span>{openLeg.dte ?? "-" }j</span>
+                                </div>
+                                <div className="pos-actions" style={{ marginTop: 8 }}>
+                                  <button
+                                    className="chip"
+                                    type="button"
+                                    disabled={!allowExpire}
+                                    title={!allowExpire ? "Disponible à J-1 avant expiration" : ""}
+                                    onClick={() =>
+                                      openCloseCallModal("expired", item, openLeg.id, openLeg.strike)
+                                    }
+                                  >
+                                    Expiré
+                                  </button>
+                                  <button
+                                    className="chip"
+                                    type="button"
+                                    disabled={!allowExpire}
+                                    title={!allowExpire ? "Disponible à J-1 avant expiration" : ""}
+                                    onClick={() =>
+                                      openCloseCallModal("exerced", item, openLeg.id, openLeg.strike)
+                                    }
+                                  >
+                                    Exercé
+                                  </button>
+                                  <button
+                                    className="chip"
+                                    type="button"
+                                    onClick={() =>
+                                      openCloseCallModal("bought_back", item, openLeg.id, openLeg.strike)
+                                    }
+                                  >
+                                    Racheté
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          }
+                          if (item.status === "viable" && item.suggested_calls?.length) {
+                            return (
+                          <>
+                          <table className="assigned-table">
+                            <thead>
+                              <tr>
+                                <th>Strike</th>
+                                <th>Dist. spot</th>
+                                <th>Prime</th>
+                                <th>APR</th>
+                                <th>DTE</th>
+                                <th>Gain call</th>
+                                <th></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {item.suggested_calls.map((call, idx) => {
+                                const otmLabel = call.otm_pct != null ? `${call.otm_pct > 0 ? "+" : ""}${call.otm_pct.toFixed(1)}% OTM` : "-";
+                                const gainCall =
+                                  call.gain_max_call ??
+                                  (call.bid != null ? call.bid * 100 * item.contracts : 0);
+                                const gainCycle = call.gain_max_cycle ?? 0;
+                                const gainPct = capital ? (gainCycle / capital) * 100 : 0;
+                                return (
+                                  <tr key={`${item.position_id}-${idx}`}>
+                                    <td>{call.strike}</td>
+                                    <td>
+                                      <div>{otmLabel}</div>
+                                      <div className="subtle">
+                                        {call.distance_to_basis?.toFixed(2)}$ ·{" "}
+                                        {call.distance_to_basis_pct?.toFixed(1)}% base
+                                      </div>
+                                    </td>
+                                    <td>{call.bid?.toFixed(2)}</td>
+                                    <td>{formatPct(call.apr ?? 0, 1)}</td>
+                                    <td>
+                                      <span
+                                        className={dteClass(call.dte)}
+                                        title={call.expiration || ""}
+                                      >
+                                        {call.dte}j
+                                      </span>
+                                    </td>
+                                    <td>
+                                      {formatMoney(gainCall)}
+                                      <div className="subtle">
+                                        Cycle: {formatMoney(gainCycle)} ·{" "}
+                                        {formatPct(gainPct, 1)}
+                                      </div>
+                                    </td>
+                                    <td>
+                                      <button
+                                        className="chip"
+                                        type="button"
+                                        onClick={() => {
+                                          setCallConfirmDraft({
+                                            position_id: item.position_id,
+                                            symbol: item.symbol,
+                                            strike: call.strike,
+                                            premium: call.bid || 0,
+                                            dte: call.dte,
+                                            expiration: call.expiration || "",
+                                          });
+                                          setCallConfirmOpen(true);
+                                        }}
+                                      >
+                                        Valider
+                                      </button>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                          <div className="pos-actions" style={{ marginTop: 8 }}>
+                            <button
+                              className="chip"
+                              type="button"
+                              onClick={() =>
+                                queryClient.invalidateQueries({ queryKey: ["assigned-calls"] })
+                              }
+                            >
+                              Réévaluer maintenant
+                            </button>
+                            <button
+                              className="chip"
+                              type="button"
+                              onClick={() =>
+                                ignoreCallMutation.mutate({
+                                  position_id: item.position_id,
+                                  ignored: true,
+                                })
+                              }
+                            >
+                              Ignorer
+                            </button>
+                          </div>
+                          </>
+                            );
+                          }
+                          return (
+                          <div className="assigned-empty">
+                            {item.message || "Aucun Call viable — conserver la position"}
+                            <div className="pos-actions" style={{ marginTop: 8 }}>
+                              <button
+                                className="chip"
+                                type="button"
+                                onClick={() =>
+                                  queryClient.invalidateQueries({ queryKey: ["assigned-calls"] })
+                                }
+                              >
+                                Réévaluer maintenant
+                              </button>
+                              <button
+                                className="chip"
+                                type="button"
+                                onClick={() =>
+                                  ignoreCallMutation.mutate({
+                                    position_id: item.position_id,
+                                    ignored: true,
+                                  })
+                                }
+                              >
+                                Ignorer
+                              </button>
+                              <input
+                                type="date"
+                                value={snoozeDates[item.position_id] || ""}
+                                onChange={(e) =>
+                                  setSnoozeDates((prev) => ({
+                                    ...prev,
+                                    [item.position_id]: e.target.value,
+                                  }))
+                                }
+                              />
+                              <button
+                                className="chip"
+                                type="button"
+                                onClick={() => {
+                                  const value = snoozeDates[item.position_id];
+                                  if (value) {
+                                    snoozeMutation.mutate({
+                                      position_id: item.position_id,
+                                      snooze_until: value,
+                                    });
+                                  }
+                                }}
+                              >
+                                Snooze
+                              </button>
+                            </div>
+                          </div>
+                          );
+                        })()
+                      ) : null}
+                      {tab === "history" ? (
+                        <div>
+                          {(item.legs || []).length === 0 ? (
+                            <div className="assigned-empty">Aucun leg enregistré.</div>
+                          ) : (
+                            <div>
+                              {(item.legs || []).map((leg, idx) => (
+                                <div className="assigned-row" key={idx}>
+                                  <span>
+                                    {leg.leg_type === "SELL PUT" ? "✅" : "🔄"}{" "}
+                                    {leg.opened_at ? new Date(leg.opened_at).toLocaleDateString("fr-FR") : "--"}
+                                  </span>
+                                  <span>
+                                    {leg.leg_type} · Strike {leg.strike}$ · Prime +{leg.premium_received}$
+                                  </span>
+                                  <span className="subtle">{legStatusLabel(leg.status)}</span>
+                                </div>
+                              ))}
+                              <div className="assigned-row" style={{ marginTop: 6 }}>
+                                <span>P&L cumulé</span>
+                                <span>
+                                  +{item.total_premiums.toFixed(2)}$ / action ·{" "}
+                                  +{formatMoney(item.total_premiums * 100 * item.contracts)}
+                                </span>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      ) : null}
                     </div>
-                    <div className="assigned-grid">
-                      <div>
-                        <span className="ck">Coût initial</span>
-                        <span className="cv">{formatMoney(item.put_strike * 100)}</span>
-                      </div>
-                      <div>
-                        <span className="ck">Coût ajusté</span>
-                        <span className="cv">{formatMoney(item.cost_basis_adjusted * 100)}</span>
-                      </div>
-                      <div>
-                        <span className="ck">Réduction</span>
-                        <span className="cv">{formatPct(item.reduction_pct, 1)}</span>
-                      </div>
-                      <div>
-                        <span className="ck">Spot</span>
-                        <span className="cv">{item.spot_price ? formatMoney(item.spot_price) : "-"}</span>
-                      </div>
-                    </div>
-                    {item.status === "viable" && item.suggested_call ? (
-                      <div className="assigned-call">
-                        <div className="assigned-row">
-                          <span>Strike</span>
-                          <span>{item.suggested_call.strike}</span>
-                        </div>
-                        <div className="assigned-row">
-                          <span>Distance coût</span>
-                          <span>
-                            {item.suggested_call.distance_to_basis?.toFixed(2)}$ ·{" "}
-                            {item.suggested_call.distance_to_basis_pct?.toFixed(1)}%
-                          </span>
-                        </div>
-                        <div className="assigned-row">
-                          <span>Prime</span>
-                          <span>{item.suggested_call.bid?.toFixed(2)}</span>
-                        </div>
-                        <div className="assigned-row">
-                          <span>APR</span>
-                          <span>{formatPct(item.suggested_call.apr ?? 0, 1)}</span>
-                        </div>
-                        <div className="assigned-row">
-                          <span>DTE</span>
-                          <span>{item.suggested_call.dte}j</span>
-                        </div>
-                        <div className="assigned-row">
-                          <span>Gain max</span>
-                          <span>{formatMoney(item.suggested_call.gain_max_cycle ?? 0)}</span>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="assigned-empty">
-                        {item.message || "Aucun Call viable — conserver la position"}
-                      </div>
-                    )}
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
             <div className="signal-list">
@@ -2220,6 +3108,24 @@ function WheelBotPage() {
               Exporter CSV
             </button>
           </div>
+
+          <div
+            className={`mobile-page ${mobilePage === "closed" ? "active" : ""}`}
+            id="page-closed"
+          >
+            <div className="params-section">
+              <div className="section-title">Cycles clôturés</div>
+              <ClosedCyclesList
+                cycles={closedCyclesQuery.data || []}
+                formatMoney={formatMoney}
+                formatPct={formatPct}
+                onNewCycle={(capital) => {
+                  setMobilePage("results");
+                  setValue("capital", capital);
+                }}
+              />
+            </div>
+          </div>
         </div>
 
         <nav className="bottom-nav">
@@ -2254,6 +3160,14 @@ function WheelBotPage() {
           >
             <span className="icon">🧾</span>
             <span className="label">Positions</span>
+          </button>
+          <button
+            className={`nav-item ${mobilePage === "closed" ? "active" : ""}`}
+            type="button"
+            onClick={() => setMobilePage("closed")}
+          >
+            <span className="icon">✅</span>
+            <span className="label">Clôturés</span>
           </button>
         </nav>
 
@@ -2387,6 +3301,43 @@ function WheelBotPage() {
             </div>
           </div>
         </div>
+      ) : null}
+
+      <CallConfirmModal
+        open={callConfirmOpen}
+        draft={callConfirmDraft}
+        onClose={() => setCallConfirmOpen(false)}
+        onChange={setCallConfirmDraft}
+        onConfirm={submitCallConfirm}
+      />
+
+      {closeCallOpen && closeCallLeg ? (
+        <CloseCallModal
+          open={closeCallOpen}
+          symbol={closeCallLeg.symbol}
+          strike={closeCallLeg.strike}
+          scenario={closeCallScenario}
+          buyback={closeCallBuyback}
+          impact={closeCallImpact}
+          impactError={closeCallImpactError}
+          onScenarioChange={setCloseCallScenario}
+          onBuybackChange={setCloseCallBuyback}
+          onClose={() => setCloseCallOpen(false)}
+          onConfirm={() => {
+            closeCallMutation.mutate({
+              position_id: closeCallLeg.position_id,
+              call_id: closeCallLeg.call_id,
+              scenario: closeCallScenario,
+              buyback_premium:
+                closeCallScenario === "bought_back"
+                  ? Number(closeCallBuyback)
+                  : undefined,
+              close_date: new Date().toISOString().slice(0, 10),
+            });
+          }}
+          formatMoney={formatMoney}
+          formatPct={formatPct}
+        />
       ) : null}
     </div>
   );

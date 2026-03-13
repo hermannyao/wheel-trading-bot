@@ -33,6 +33,8 @@ from config import (
     MIN_APR,
     DELTA_MIN,
     DELTA_MAX,
+    CALL_DELTA_MIN,
+    CALL_DELTA_MAX,
     MAX_SPREAD_PCT,
     MAX_WORKERS,
     RISK_FREE_RATE,
@@ -489,6 +491,12 @@ async def snooze_position(position_id: int, snooze_until: str, db: Session = Dep
     return service.snooze_position(position_id, date_value)
 
 
+@app.post("/api/positions/{position_id}/ignore-call", response_model=PositionResponse)
+async def ignore_call(position_id: int, ignored: bool = True, db: Session = Depends(get_db)):
+    service = PositionService(db)
+    return service.set_ignore_calls(position_id, ignored)
+
+
 @app.patch("/api/positions/{position_id}/calls/{call_id}/close", response_model=PositionLegResponse)
 async def close_call_leg(position_id: int, call_id: int, payload: PositionLegClose, db: Session = Depends(get_db)):
     service = PositionService(db)
@@ -614,6 +622,26 @@ async def get_assigned_calls(db: Session = Depends(get_db)):
         )
         price = prices.get(p.symbol)
         today = datetime.utcnow().date()
+        if p.ignore_calls:
+            suggestions.append({
+                "position_id": p.id,
+                "symbol": p.symbol,
+                "assigned_at": p.assigned_at,
+                "put_strike": p.strike,
+                "contracts": p.contracts,
+                "shares": p.contracts * 100,
+                "premium_put": p.premium_received,
+                "total_premiums": total_premiums,
+                "cost_basis_adjusted": round(cost_basis_adjusted, 2),
+                "reduction_pct": round(reduction_pct, 2),
+                "spot_price": round(price, 2) if price else None,
+                "status": "ignored",
+                "message": "Call ignoré — aucune suggestion affichée.",
+                "suggested_calls": None,
+                "legs": legs_payload,
+                "snooze_until": p.snooze_until,
+            })
+            continue
         if p.snooze_until and p.snooze_until >= today:
             suggestions.append({
                 "position_id": p.id,
@@ -680,6 +708,7 @@ async def get_assigned_calls(db: Session = Depends(get_db)):
             symbol=p.symbol,
             price=price,
             cost_basis=cost_basis_adjusted,
+            put_strike=p.strike,
             contracts=p.contracts,
             overrides={
                 "min_dte": MIN_DTE,
@@ -688,6 +717,8 @@ async def get_assigned_calls(db: Session = Depends(get_db)):
                 "min_apr": MIN_APR,
                 "min_open_interest": MIN_OPEN_INTEREST,
                 "max_spread_pct": MAX_SPREAD_PCT,
+                "call_delta_min": CALL_DELTA_MIN,
+                "call_delta_max": CALL_DELTA_MAX,
             },
         )
         if calls:
@@ -827,6 +858,8 @@ async def get_scan_config():
         "min_apr": MIN_APR,
         "delta_min": DELTA_MIN,
         "delta_max": DELTA_MAX,
+        "call_delta_min": CALL_DELTA_MIN,
+        "call_delta_max": CALL_DELTA_MAX,
         "max_spread_pct": MAX_SPREAD_PCT,
         "max_workers": MAX_WORKERS,
         "risk_free_rate": RISK_FREE_RATE,

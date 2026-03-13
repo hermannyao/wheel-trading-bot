@@ -151,6 +151,7 @@ export interface Position {
 }
 
 export interface AssignedCallSuggestion {
+  position_id: number;
   symbol: string;
   assigned_at: string;
   put_strike: number;
@@ -163,7 +164,7 @@ export interface AssignedCallSuggestion {
   spot_price?: number | null;
   status: string;
   message?: string | null;
-  suggested_call?: {
+  suggested_calls?: {
     strike: number;
     dte: number;
     bid?: number | null;
@@ -172,5 +173,48 @@ export interface AssignedCallSuggestion {
     distance_to_basis_pct?: number | null;
     otm_pct?: number | null;
     gain_max_cycle?: number | null;
-  } | null;
+    expiration?: string | null;
+  }[] | null;
+  legs?: {
+    leg_type: string;
+    strike: number;
+    premium_received: number;
+    opened_at?: string | null;
+    expiration_date?: string | null;
+    status?: string | null;
+  }[] | null;
+  snooze_until?: string | null;
+}
+
+export interface ClosedCycle {
+  position_id: number;
+  symbol: string;
+  closed_at?: string | null;
+  capital_initial: number;
+  total_premiums: number;
+  delivery_price?: number | null;
+  pnl_total: number;
+  pnl_pct: number;
+  duration_days?: number | null;
+  contracts: number;
+  legs?: {
+    leg_type: string;
+    strike: number;
+    premium_received: number;
+    opened_at?: string | null;
+    expiration_date?: string | null;
+    status?: string | null;
+    closed_at?: string | null;
+  }[] | null;
+}
+
+export interface CallCloseImpact {
+  current_cost_basis: number;
+  new_cost_basis: number;
+  total_premiums: number;
+  total_premiums_after: number;
+  pnl_total?: number | null;
+  pnl_pct?: number | null;
+  delivery_price?: number | null;
+  capital_initial: number;
 }
